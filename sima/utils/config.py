@@ -1,6 +1,7 @@
 # sima/utils/config.py
 import json
 import os
+import torch
 from typing import Dict, Any
 
 def load_config(config_path: str) -> Dict[str, Any]:

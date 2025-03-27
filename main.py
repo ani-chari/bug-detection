@@ -208,7 +208,7 @@ class SIMAAgent:
             response = self.llm_client.chat.completions.create(
                 model="o3-mini",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=150
+                max_completion_tokens=150
             )
             
             return response.choices[0].message.content.strip()

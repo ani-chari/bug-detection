@@ -138,6 +138,29 @@ class SIMAAgent:
             "visual_change": visual_change
         }
     
+    def _process_instruction(self, instruction: str, observation: torch.Tensor) -> Dict[str, Any]:
+        """Process an instruction and observation to generate an action plan"""
+        # Use torch.no_grad() to prevent gradient tracking during inference
+        with torch.no_grad():
+            # Encode the instruction
+            instruction_embedding = self.language_model(instruction)
+            
+            # Encode the observation
+            visual_embedding = self.vision_model(observation)
+            
+            # Integrate vision and language to generate action plan
+            action_plan = self.integration_model(visual_embedding, instruction_embedding)
+        
+        # Calculate visual change expected
+        visual_change = self._calculate_expected_visual_change(instruction)
+        
+        return {
+            "action_plan": action_plan,
+            "visual_embedding": visual_embedding.detach(),  # Ensure tensor is detached
+            "instruction_embedding": instruction_embedding.detach(),  # Ensure tensor is detached
+            "visual_change": visual_change
+        }
+
     def _evaluate_success(
         self, 
         initial_obs: torch.Tensor,
@@ -150,12 +173,13 @@ class SIMAAgent:
         if not execution_result.get("success", True):
             return False
         
-        # Encode observations
-        initial_embedding = self.vision_model(initial_obs)
-        final_embedding = self.vision_model(final_obs)
-        
-        # Calculate visual difference
-        visual_diff = torch.norm(final_embedding - initial_embedding, p=2).item()
+        # Encode observations with no gradient tracking
+        with torch.no_grad():
+            initial_embedding = self.vision_model(initial_obs)
+            final_embedding = self.vision_model(final_obs)
+            
+            # Calculate visual difference - detach before calling item()
+            visual_diff = torch.norm(final_embedding - initial_embedding, p=2).detach().item()
         
         # Get expected visual change
         expected_change = self._calculate_expected_visual_change(instruction)
@@ -168,8 +192,52 @@ class SIMAAgent:
         
         return True
     
+    def _generate_observation_description(
+        self,
+        initial_obs: torch.Tensor,
+        final_obs: torch.Tensor,
+        instruction: str,
+        success: bool
+    ) -> str:
+        """Generate a textual description of the observation"""
+        # Ensure we're not tracking gradients when processing tensors
+        with torch.no_grad():
+            # If you need to use the tensors for any computation, do it here
+            pass
+            
+        instruction_lower = instruction.lower()
+        
+        if not success:
+            return f"Failed to execute '{instruction}'. No significant change observed."
+        
+        # Generate success descriptions based on action type
+        if any(word in instruction_lower for word in ["move", "walk", "run", "go"]):
+            return "Character moved to the specified location. Environment changed accordingly."
+        elif any(word in instruction_lower for word in ["attack", "hit", "strike"]):
+            return "Character performed attack animation. Target reacted with appropriate feedback."
+        elif any(word in instruction_lower for word in ["pick", "grab", "take", "collect"]):
+            return "Item was collected and added to inventory. Visual feedback confirmed acquisition."
+        elif "open" in instruction_lower:
+            return "Object opened, revealing contents. Animation and sound effects played correctly."
+        elif "jump" in instruction_lower:
+            return "Character performed jumping animation, briefly leaving the ground."
+        elif "use" in instruction_lower:
+            return "Item was used successfully. Appropriate effects and animations were displayed."
+        
+        # Generic success message
+        return f"Action '{instruction}' was executed successfully."
+    
+
     def _calculate_expected_visual_change(self, instruction: str) -> float:
-        """Calculate expected visual change for an instruction"""
+        """
+        Calculate expected visual change for an instruction.
+
+        Args:
+            instruction (str): Natural language instruction.
+
+        Returns:
+            float: Expected visual change value.
+        """
         instruction_lower = instruction.lower()
         
         # High-change actions
@@ -202,35 +270,4 @@ class SIMAAgent:
         
         # Default - medium expectation
         return 0.3
-    
-    def _generate_observation_description(
-        self,
-        initial_obs: torch.Tensor,
-        final_obs: torch.Tensor,
-        instruction: str,
-        success: bool
-    ) -> str:
-        """Generate a textual description of the observation"""
-        # This would ideally use a vision-language model to describe the change
-        # For now, use basic templating based on instruction and success
-        instruction_lower = instruction.lower()
-        
-        if not success:
-            return f"Failed to execute '{instruction}'. No significant change observed."
-        
-        # Generate success descriptions based on action type
-        if any(word in instruction_lower for word in ["move", "walk", "run", "go"]):
-            return "Character moved to the specified location. Environment changed accordingly."
-        elif any(word in instruction_lower for word in ["attack", "hit", "strike"]):
-            return "Character performed attack animation. Target reacted with appropriate feedback."
-        elif any(word in instruction_lower for word in ["pick", "grab", "take", "collect"]):
-            return "Item was collected and added to inventory. Visual feedback confirmed acquisition."
-        elif "open" in instruction_lower:
-            return "Object opened, revealing contents. Animation and sound effects played correctly."
-        elif "jump" in instruction_lower:
-            return "Character performed jumping animation, briefly leaving the ground."
-        elif "use" in instruction_lower:
-            return "Item was used successfully. Appropriate effects and animations were displayed."
-        
-        # Generic success message
-        return f"Action '{instruction}' was executed successfully."
+

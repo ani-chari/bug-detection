@@ -26,8 +26,27 @@ class VisionModel(nn.Module):
             self.processor = AutoProcessor.from_pretrained(self.model_name)
             self.model = AutoModel.from_pretrained(self.model_name)
             
-            # Get embedding dimension
-            self.embedding_dim = self.model.config.hidden_size
+            # In sima/models/vision.py
+            # Find where you're trying to access model.config.hidden_size and replace with:
+
+            try:
+                # Try to get embedding dimension from different possible attributes
+                if hasattr(self.model.config, 'hidden_size'):
+                    self.embedding_dim = self.model.config.hidden_size
+                elif hasattr(self.model.config, 'projection_dim'):
+                    # CLIP models often use projection_dim instead
+                    self.embedding_dim = self.model.config.projection_dim
+                elif hasattr(self.model, 'vision_model') and hasattr(self.model.vision_model.config, 'hidden_size'):
+                    self.embedding_dim = self.model.vision_model.config.hidden_size
+                else:
+                    # Default fallback dimension
+                    self.embedding_dim = 512
+                    self.logger.warning("Could not determine model embedding dimension, using default: 512")
+                    
+            except AttributeError as e:
+                self.logger.warning(f"Error accessing model config: {e}")
+                self.embedding_dim = 512
+
             
             # Add projection layer (as mentioned in SIMA paper)
             self.projection = nn.Sequential(
