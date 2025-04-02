@@ -50,63 +50,112 @@ class ActionModel(nn.Module):
     
     def forward(self, integrated_embedding: torch.Tensor) -> List[Dict[str, Any]]:
         """
-        Generate actions from integrated embedding
+        Generate mobile-specific actions for a game with Subway Surfers-like mechanics
+        from integrated vision-language embedding.
         
         Args:
-            integrated_embedding: Integrated vision-language embedding
-            
+            integrated_embedding: Tensor of shape (batch_size, embedding_dim)
+                containing the integrated vision-language representation
+                
         Returns:
-            List of action dictionaries
+            List of action dictionaries ready for execution by the input controller
         """
-        # Apply shared layers
+        # Extract features using shared layers
         features = self.shared_layers(integrated_embedding)
         
-        # Get action logits
-        keyboard_logits = self.keyboard_head(features)
-        mouse_action_logits = self.mouse_action_head(features)
-        mouse_position = torch.sigmoid(self.mouse_position_head(features))  # 0 to 1
+        # Action type prediction
+        # Higher score for more appropriate action given the current game state
+        action_scores = self.action_head(features)
+        action_probs = torch.softmax(action_scores, dim=-1)
         
-        # Convert to probabilities
-        keyboard_probs = torch.softmax(keyboard_logits, dim=-1)
-        mouse_action_probs = torch.softmax(mouse_action_logits, dim=-1)
+        # Get the most appropriate action type based on highest probability
+        action_type_idx = torch.argmax(action_probs, dim=-1).item()
+        action_types = ["tap", "swipe_up", "swipe_down", "swipe_left", "swipe_right"]
+        chosen_action = action_types[action_type_idx]
         
-        # Select top actions
-        keyboard_action = torch.argmax(keyboard_probs, dim=-1).item()
-        mouse_action = torch.argmax(mouse_action_probs, dim=-1).item()
+        # Position prediction for taps and swipes
+        position_coords = torch.sigmoid(self.position_head(features))  # Range [0,1]
+        x_pos, y_pos = position_coords[0].item(), position_coords[1].item()
         
-        # Create action plan
-        action_plan = []
+        # Create action based on predicted type
+        if chosen_action == "tap":
+            # Return a tap action at the predicted position
+            return [{
+                "type": "touch",
+                "action": "tap",
+                "position": {
+                    "x": x_pos,
+                    "y": y_pos
+                }
+            }]
+        elif chosen_action == "swipe_up":
+            # Swipe up (jump in Subway Surfers)
+            return [{
+                "type": "swipe",
+                "action": "swipe",
+                "start": {
+                    "x": 0.5,  # Center of screen horizontally
+                    "y": 0.7   # Lower part of screen
+                },
+                "end": {
+                    "x": 0.5,  # Keep horizontal position
+                    "y": 0.2   # Swipe toward top
+                },
+                "duration": 0.2  # Fast swipe
+            }]
+        elif chosen_action == "swipe_down":
+            # Swipe down (roll in Subway Surfers)
+            return [{
+                "type": "swipe",
+                "action": "swipe",
+                "start": {
+                    "x": 0.5,  # Center of screen horizontally
+                    "y": 0.3   # Upper part of screen
+                },
+                "end": {
+                    "x": 0.5,  # Keep horizontal position
+                    "y": 0.8   # Swipe toward bottom
+                },
+                "duration": 0.2  # Fast swipe
+            }]
+        elif chosen_action == "swipe_left":
+            # Swipe left (move left in Subway Surfers)
+            return [{
+                "type": "swipe",
+                "action": "swipe",
+                "start": {
+                    "x": 0.7,  # Right part of screen
+                    "y": 0.5   # Center of screen vertically
+                },
+                "end": {
+                    "x": 0.3,  # Swipe toward left
+                    "y": 0.5   # Keep vertical position
+                },
+                "duration": 0.15  # Very fast swipe
+            }]
+        elif chosen_action == "swipe_right":
+            # Swipe right (move right in Subway Surfers)
+            return [{
+                "type": "swipe",
+                "action": "swipe",
+                "start": {
+                    "x": 0.3,  # Left part of screen
+                    "y": 0.5   # Center of screen vertically
+                },
+                "end": {
+                    "x": 0.7,  # Swipe toward right
+                    "y": 0.5   # Keep vertical position
+                },
+                "duration": 0.15  # Very fast swipe
+            }]
         
-        # Add keyboard action
-        if keyboard_action < self.num_keyboard_actions:
-            key_idx = keyboard_action // 2
-            is_press = keyboard_action % 2 == 0
-            key = self.keyboard_keys[key_idx]
-            
-            action_plan.append({
-                "type": "keyboard",
-                "key": key,
-                "action": "press" if is_press else "release"
-            })
-        
-        # Add mouse action
-        mouse_actions = ["move", "left_click", "right_click", "scroll"]
-        if mouse_action < len(mouse_actions):
-            mouse_action_name = mouse_actions[mouse_action]
-            
-            if mouse_action_name == "move":
-                # Get position coordinates
-                x, y = mouse_position[0].cpu().numpy().tolist()
-                
-                action_plan.append({
-                    "type": "mouse",
-                    "action": "move",
-                    "position": {"x": x, "y": y}
-                })
-            else:
-                action_plan.append({
-                    "type": "mouse",
-                    "action": mouse_action_name
-                })
-        
-        return action_plan
+        # Fallback (shouldn't normally reach here)
+        return [{
+            "type": "touch",
+            "action": "tap",
+            "position": {
+                "x": 0.5,
+                "y": 0.5
+            }
+        }]
+
