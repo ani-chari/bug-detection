@@ -95,44 +95,73 @@ class InputController:
             return {"success": False, "message": str(e), "type": "keyboard", "key": key}
     
     def _execute_mouse_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a mouse action"""
+        """Execute a mouse action as touch equivalent"""
         action_name = action.get("action", "")
-        
-        if not action_name:
-            return {"success": False, "message": "No mouse action specified"}
         
         try:
             if action_name == "move":
-                # Get position
+                # Convert to touch move event
                 position = action.get("position", {})
-                x = position.get("x", 0.5)
-                y = position.get("y", 0.5)
-                
-                # Convert normalized coordinates to screen coordinates
-                screen_width, screen_height = pyautogui.size()
-                screen_x = int(x * screen_width)
-                screen_y = int(y * screen_height)
-                
-                # Move mouse
-                pyautogui.moveTo(screen_x, screen_y)
-                return {"success": True, "type": "mouse", "action": "move", "position": (screen_x, screen_y)}
+                x, y = int(position.get("x", 0.5) * screen_width), int(position.get("y", 0.5) * screen_height)
+                pyautogui.moveTo(x, y)
+                return {"success": True, "type": "touch", "action": "move", "position": (x, y)}
                 
             elif action_name == "left_click":
+                # Convert to touch tap event
                 pyautogui.click()
-                return {"success": True, "type": "mouse", "action": "left_click"}
+                return {"success": True, "type": "touch", "action": "tap"}
                 
             elif action_name == "right_click":
-                pyautogui.rightClick()
-                return {"success": True, "type": "mouse", "action": "right_click"}
+                # Convert to touch long press
+                pyautogui.mouseDown(); time.sleep(0.7); pyautogui.mouseUp()
+                return {"success": True, "type": "touch", "action": "long_press"}
                 
             elif action_name == "scroll":
-                # Get scroll amount
+                # Map to touch swipe
                 amount = action.get("amount", 5)
-                pyautogui.scroll(amount)
-                return {"success": True, "type": "mouse", "action": "scroll", "amount": amount}
-                
-            else:
-                return {"success": False, "message": f"Invalid mouse action: {action_name}"}
+                direction = "up" if amount > 0 else "down"
+                pyautogui.drag(0, -amount * 10, 0.3, button='left')
+                return {"success": True, "type": "touch", "action": "swipe", "direction": direction}
                 
         except Exception as e:
             return {"success": False, "message": str(e), "type": "mouse", "action": action_name}
+        
+
+    def _execute_touch_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute touch-specific actions"""
+        action_name = action.get("action", "")
+        
+        try:
+            if action_name == "swipe":
+                direction = action.get("direction", "up")
+                distance = action.get("distance", 100)
+                
+                # Get current position
+                current_x, current_y = pyautogui.position()
+                
+                # Calculate end position based on direction
+                if direction == "up":
+                    pyautogui.drag(0, -distance, 0.3, button='left')
+                elif direction == "down":
+                    pyautogui.drag(0, distance, 0.3, button='left')
+                elif direction == "left":
+                    pyautogui.drag(-distance, 0, 0.3, button='left')
+                elif direction == "right":
+                    pyautogui.drag(distance, 0, 0.3, button='left')
+                
+                return {"success": True, "type": "touch", "action": "swipe", "direction": direction}
+                
+            elif action_name == "pinch":
+                # Simulate pinch gesture for zoom
+                scale = action.get("scale", 0.5)  # <1 for pinch in, >1 for pinch out
+                # Implementation depends on your simulator's capabilities
+                # This is a simplified version
+                pyautogui.keyDown('ctrl')
+                pyautogui.scroll(-100 if scale < 1 else 100)
+                pyautogui.keyUp('ctrl')
+                
+                return {"success": True, "type": "touch", "action": "pinch", "scale": scale}
+        
+        except Exception as e:
+            return {"success": False, "message": str(e), "type": "mouse", "action": action_name}
+

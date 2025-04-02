@@ -284,44 +284,34 @@ class TesterAgent:
         self.llm_client = llm_client
         self.logger = logging.getLogger(__name__ + ".TesterAgent")
     
-    def generate_test_tasks(
-        self, 
-        game_description: str, 
-        feature_description: str,
-        num_tasks: int = 10
-    ) -> List[TestTask]:
-        """Generate test tasks based on game and feature descriptions"""
-        self.logger.info(f"Generating {num_tasks} test tasks")
-        
+    def generate_test_tasks(self, game_description: str, feature_description: str, num_tasks: int = 10):
+        """Generate mobile-specific test tasks"""
         prompt = f"""
-        You are an expert game tester specializing in detecting bugs in video games. Your task is to generate 
-        comprehensive test cases for a new feature.
+        You are an expert mobile game tester. Generate {num_tasks} test cases for a mobile game with touch controls.
         
         Game Description:
         {game_description}
         
-        New Feature Description:
+        Feature Description:
         {feature_description}
         
-        Generate {num_tasks} thorough test cases that will effectively identify bugs in this feature and its integration 
-        with the game. Cover both expected usage and edge cases. Focus especially on:
-        
-        1. Core functionality testing
-        2. Integration with existing game systems
-        3. Edge cases and boundary conditions
-        4. Performance implications
-        5. User experience considerations
-        6. Potential exploits or unintended uses
+        Focus on mobile-specific issues such as:
+        1. Touch responsiveness and accuracy
+        2. Multi-touch gesture recognition (if applicable)
+        3. UI element sizing and spacing for touch targets
+        4. Input lag or touch registration issues
+        5. Touch controls working across different screen orientations
+        6. Proper handling of rapid touch inputs
+        7. Swipe gesture recognition and tracking
         
         For each test case, provide:
-        - task_id: A unique identifier (e.g., "TASK-001")
+        - task_id: A unique identifier
         - description: Detailed description of what to test
-        - initial_state: Precise preconditions needed for the test
-        - expected_outcome: The exact expected behavior when the feature works correctly
-        - priority: Priority level ("high", "medium", or "low")
-        - potential_bugs: Specific bugs or issues that might be found with this test
+        - initial_state: Required preconditions
+        - expected_outcome: Expected behavior when working correctly
+        - potential_bugs: Mobile-specific issues that might occur
         
-        Format your response as a JSON object with an array of test task objects under the "tasks" key.
+        Format your response as JSON with an array of tasks.
         """
         
         try:
@@ -366,24 +356,10 @@ class HighLevelPlanner:
         self.llm_client = llm_client
         self.logger = logging.getLogger(__name__ + ".HighLevelPlanner")
     
-    def generate_action_plan(
-        self, 
-        game_description: str, 
-        feature_description: str,
-        test_task: TestTask
-    ) -> List[ActionStep]:
-        """Generate an action plan for a test task"""
-        self.logger.info(f"Generating action plan for task {test_task.task_id}")
-        
+    def generate_action_plan(self, game_description: str, feature_description: str, test_task: TestTask):
+        """Generate action plans with mobile touch interactions"""
         prompt = f"""
-        You are an expert AI planner for game testing, inspired by approaches like DEPS and Voyager. Your role is 
-        to create a detailed, executable action plan for testing a specific game feature using a SIMA agent.
-        
-        The SIMA agent can:
-        - Perceive the game environment visually
-        - Execute natural language instructions through keyboard/mouse controls
-        - Navigate 3D environments and interact with game elements
-        - Follow multi-step instructions
+        Create a detailed test plan using touch controls for a mobile game test.
         
         Game Context:
         {game_description}
@@ -394,22 +370,23 @@ class HighLevelPlanner:
         Test Task:
         {json.dumps(test_task.to_dict(), indent=2)}
         
-        Create a detailed, robust action plan with the following properties:
-        1. Steps should be atomic and directly executable by SIMA
-        2. Start with steps to reach the initial state described in the test task
-        3. Include verification steps to check if actions had the expected effects
-        4. Provide fallback options for potentially unreliable actions
-        5. Mark critical steps as checkpoints (failure would abort the test)
+        Create an action plan using these mobile-specific interactions:
+        1. Tap - single touch and release
+        2. Double tap - two quick taps
+        3. Long press - touch and hold
+        4. Swipe - touch, move, release in one direction
+        5. Pinch - two-finger zoom in/out (if applicable)
+        6. Rotation - two-finger circular motion (if applicable)
         
         For each step, provide:
-        - step_id: A unique identifier (e.g., "STEP-001")
-        - action_description: Clear, specific instruction for SIMA
-        - expected_observation: What should be observed if this action succeeds
-        - success_criteria: How to determine if the step succeeded
-        - fallback_action: Alternative action if the primary action fails (optional)
-        - is_checkpoint: Boolean indicating if this is a critical step
+        - step_id: A unique identifier
+        - action_description: Clear instruction (what touch action to perform and where)
+        - expected_observation: What should be observed
+        - success_criteria: How to determine success
+        - fallback_action: Alternative if the main action fails
+        - is_checkpoint: Whether this step is critical
         
-        Format your response as a JSON object with an array of step objects under the "steps" key.
+        Format as JSON with an array of steps.
         """
         
         try:
