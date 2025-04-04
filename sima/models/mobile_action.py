@@ -1,16 +1,14 @@
-# sima/models/action.py
+# sima/models/mobile_action.py
 import torch
 import torch.nn as nn
 from typing import Dict, Any, List
 import logging
 
-class ActionModel(nn.Module):
-    """
-    Action model for SIMA that generates keyboard/mouse actions from integrated representations.
-    Converts high-level understanding into concrete control actions.
-    """
+class MobileActionModel(nn.Module):
+    """Action model for mobile games that generates touch and swipe actions"""
     
     def __init__(self, config: Dict[str, Any]):
+        """Initialize action model with configuration"""
         super().__init__()
         self.logger = logging.getLogger(__name__)
         
@@ -26,22 +24,21 @@ class ActionModel(nn.Module):
             nn.GELU(),
         )
         
-        # Add the missing action_head attribute
-        self.action_head = nn.Linear(self.hidden_dim, 5)  # 5 actions for mobile game controls
+        # Define action prediction head (explicitly named action_head)
+        self.action_head = nn.Linear(self.hidden_dim, 5)  # 5 actions: tap, swipe up/down/left/right
         
         # Define position prediction for tap actions
         self.position_head = nn.Sequential(
             nn.Linear(self.hidden_dim, 256),
             nn.GELU(),
-            nn.Linear(256, 2)  # x, y coordinates (0 to 1)
+            nn.Linear(256, 2)  # x, y coordinates
         )
         
-        self.logger.info("Action model initialized successfully")
-
+        self.logger.info("Mobile action model initialized successfully")
     
     def forward(self, integrated_embedding: torch.Tensor) -> List[Dict[str, Any]]:
         """
-        Generate actions for a jelly block sliding puzzle game from integrated embedding
+        Generate actions for a puzzle game from integrated embedding
         
         Args:
             integrated_embedding: Integrated vision-language embedding
@@ -60,12 +57,22 @@ class ActionModel(nn.Module):
             # Select the most appropriate action
             action_type_idx = torch.argmax(action_probs, dim=-1).item()
             
-            # Define available actions for this game (4 swipe directions)
-            actions = ["swipe_up", "swipe_down", "swipe_left", "swipe_right"]
+            # Define available actions for this game (4 swipe directions + tap)
+            actions = ["tap", "swipe_up", "swipe_down", "swipe_left", "swipe_right"]
             chosen_action = actions[action_type_idx % len(actions)]
         
         # Convert to action dictionary
-        if chosen_action == "swipe_up":
+        if chosen_action == "tap":
+            # Get tap position
+            position = torch.sigmoid(self.position_head(features))
+            x, y = position[0].item(), position[1].item()
+            
+            return [{
+                "type": "touch",
+                "action": "tap",
+                "position": {"x": x, "y": y}
+            }]
+        elif chosen_action == "swipe_up":
             return [{
                 "type": "swipe",
                 "action": "swipe",
@@ -97,12 +104,3 @@ class ActionModel(nn.Module):
                 "end": {"x": 0.7, "y": 0.5},
                 "duration": 0.3
             }]
-        
-        # Fallback (shouldn't reach here)
-        return [{
-            "type": "touch",
-            "action": "tap",
-            "position": {"x": 0.5, "y": 0.5}
-        }]
-
-

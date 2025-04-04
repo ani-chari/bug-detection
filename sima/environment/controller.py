@@ -28,7 +28,8 @@ class InputController:
                 return
                 
             # Use the first available device
-            device_serial = device_lines[0].split('\t')[0]
+            # device_serial = device_lines[0].split('\t')[0]
+            device_serial = "localhost:5555"
             self.device = u2.connect(device_serial)
             self.logger.info(f"Connected to device: {device_serial}")
             

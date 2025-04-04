@@ -1,24 +1,56 @@
-import torch
-import numpy as np
-import logging
-from typing import Dict, Any
+# sima/environment/adb_observer.py
 import subprocess
 import tempfile
 import os
 from PIL import Image
+import numpy as np
+import torch
+import logging
+from typing import Dict, Any
 
-class ScreenObserver:
-    """
-    Screen observer that captures screenshots from the Android emulator via ADB
-    """
+class ADBScreenObserver:
+    """Screen observer that captures screenshots from Android devices via ADB"""
     
     def __init__(self, config: Dict[str, Any]):
-        """Initialize screen observer with configuration"""
+        """Initialize observer with configuration"""
         self.config = config
         self.logger = logging.getLogger(__name__)
-        
-        # Get configuration
         self.resize_shape = config.get("resize_shape", (224, 224))
+        
+        # Initialize device ID
+        self.device_id = config.get("device_id", None)
+        if not self.device_id:
+            self._find_device_id()
+            
+    def _find_device_id(self):
+        """Find a connected BlueStacks device ID"""
+        try:
+            result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
+            lines = result.stdout.strip().split('\n')[1:]  # Skip the first line
+            
+            bluestacks_devices = []
+            for line in lines:
+                if line.strip():
+                    parts = line.split()
+                    if len(parts) >= 2 and "device" in parts[1]:
+                        device_id = parts[0]
+                        # Check if this is BlueStacks (usually has localhost in the name)
+                        if "localhost" in device_id:
+                            bluestacks_devices.append(device_id)
+            
+            if bluestacks_devices:
+                self.device_id = bluestacks_devices[0]
+                self.logger.info(f"Using BlueStacks device: {self.device_id}")
+            elif lines:
+                # Use the first available device if no BlueStacks detected
+                self.device_id = lines[0].split()[0]
+                self.logger.info(f"Using device: {self.device_id}")
+            else:
+                self.logger.warning("No devices found. ADB commands will likely fail.")
+                self.device_id = None  # Ensure it's explicitly None
+        except Exception as e:
+            self.logger.error(f"Error finding device ID: {e}")
+            self.device_id = None  # Ensure it's explicitly None
     
     def get_observation(self) -> torch.Tensor:
         """Capture and process a screenshot from the emulator"""
@@ -37,7 +69,7 @@ class ScreenObserver:
                 subprocess.run(['adb', 'pull', '/sdcard/screenshot.png', temp_path], check=True)
             
             # Load the image and explicitly convert to RGB
-            img = Image.open(temp_path).convert('RGB')  # Add this explicit conversion to RGB
+            img = Image.open(temp_path).convert('RGB')
             
             # Resize image
             img = img.resize(self.resize_shape)
@@ -45,12 +77,6 @@ class ScreenObserver:
             # Convert to numpy array
             img_np = np.array(img)
             
-            # Ensure the image has the right dimensions (H, W, 3)
-            if len(img_np.shape) == 2:  # Grayscale
-                img_np = np.stack([img_np, img_np, img_np], axis=2)
-            elif img_np.shape[2] == 4:  # RGBA
-                img_np = img_np[:, :, :3]  # Take only RGB channels
-                
             # Convert to tensor (C, H, W) - PyTorch format
             img_tensor = torch.tensor(img_np).permute(2, 0, 1).float() / 255.0
             

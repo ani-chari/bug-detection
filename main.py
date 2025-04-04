@@ -7,6 +7,8 @@ from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # Import required libraries
 import torch
 import numpy as np
@@ -104,13 +106,15 @@ class Bug:
 
 
 # Updated SIMAAgent integration for your pipeline
-class SIMAAgent:
+from sima.agent import SIMAAgent as SIMACore
+class SIMAAgent(SIMACore):
     """
     SIMA agent integration for the game testing pipeline
     """
     
     def __init__(self, config: Dict[str, Any] = None):
         """Initialize SIMA agent"""
+        super().__init__()
         self.config = config or {}
         self.logger = logging.getLogger(__name__ + ".SIMAAgent")
         
@@ -120,7 +124,8 @@ class SIMAAgent:
         
         try:
             # Import our SIMA implementation
-            from sima import SIMAAgent as SIMACore
+            from sima.agent import SIMAAgent as SIMACore
+            print(SIMACore.__module__)
             from sima.utils.config import default_config
             
             # Create SIMA configuration by combining defaults with user config
@@ -138,16 +143,11 @@ class SIMAAgent:
             
             # Initialize SIMA core
             self.logger.info("Initializing SIMA core")
-            self.sima = SIMACore(sima_config)
+            self.sima = SIMACore()  # Use the SIMACore class directly
             self.logger.info("SIMA core initialized successfully")
-            
         except ImportError as e:
             self.logger.error(f"Failed to import SIMA: {str(e)}")
             self.logger.info("Make sure the SIMA package is installed")
-            self.logger.info("Using simulated functionality")
-            self.sima = None
-        except Exception as e:
-            self.logger.error(f"Error initializing SIMA: {str(e)}")
             self.logger.info("Using simulated functionality")
             self.sima = None
     
@@ -285,33 +285,37 @@ class TesterAgent:
         self.logger = logging.getLogger(__name__ + ".TesterAgent")
     
     def generate_test_tasks(self, game_description: str, feature_description: str, num_tasks: int = 10):
-        """Generate mobile-specific test tasks"""
+        """Generate general game testing tasks with mechanics-focused approach"""
+        logger.info("Tester agent: Generating test tasks")
+        
         prompt = f"""
-        You are an expert mobile game tester. Generate {num_tasks} test cases for a mobile game with touch controls.
+        You are an expert game tester who creates comprehensive test plans for any type of video game.
+        Generate {num_tasks} test tasks that focus on understanding game mechanics and identifying potential issues.
         
         Game Description:
         {game_description}
         
-        Feature Description:
+        Feature to Test:
         {feature_description}
         
-        Focus on mobile-specific issues such as:
-        1. Touch responsiveness and accuracy
-        2. Multi-touch gesture recognition (if applicable)
-        3. UI element sizing and spacing for touch targets
-        4. Input lag or touch registration issues
-        5. Touch controls working across different screen orientations
-        6. Proper handling of rapid touch inputs
-        7. Swipe gesture recognition and tracking
+        Create test tasks that:
+        1. Explore core game mechanics in depth
+        2. Test boundary conditions where rules might break
+        3. Verify that game objectives are achievable
+        4. Check for consistency in how rules are applied
+        5. Examine edge cases where mechanics interact in unexpected ways
+        
+        Each test should be designed to first understand how the game works before assuming anything is a bug.
+        Remember that unsuccessful actions may be valid game constraints, not bugs.
         
         For each test case, provide:
-        - task_id: A unique identifier
-        - description: Detailed description of what to test
-        - initial_state: Required preconditions
-        - expected_outcome: Expected behavior when working correctly
-        - potential_bugs: Mobile-specific issues that might occur
+        - task_id: A unique identifier (e.g., "TASK-001")
+        - description: Detailed description of what aspect of the game to test
+        - initial_state: What condition the game should be in before testing
+        - expected_outcome: What should happen if the game is functioning correctly
+        - potential_bugs: What types of issues this test might reveal
         
-        Format your response as JSON with an array of tasks.
+        Format your response as a JSON object with an array of test task objects under the "tasks" key.
         """
         
         try:
@@ -357,9 +361,12 @@ class HighLevelPlanner:
         self.logger = logging.getLogger(__name__ + ".HighLevelPlanner")
     
     def generate_action_plan(self, game_description: str, feature_description: str, test_task: TestTask):
-        """Generate action plans with mobile touch interactions"""
+        """Generate an action plan with mechanics exploration phase first"""
+        logger.info(f"Planner agent: Creating plan for task {test_task.task_id}")
+        
         prompt = f"""
-        Create a detailed test plan using touch controls for a mobile game test.
+        You are an expert game tester who understands how to methodically explore game mechanics before testing for bugs.
+        Create a detailed testing plan that first explores how the game works, then tests specific features for bugs.
         
         Game Context:
         {game_description}
@@ -370,24 +377,36 @@ class HighLevelPlanner:
         Test Task:
         {json.dumps(test_task.to_dict(), indent=2)}
         
-        Create an action plan using these mobile-specific interactions:
-        1. Tap - single touch and release
-        2. Double tap - two quick taps
-        3. Long press - touch and hold
-        4. Swipe - touch, move, release in one direction
-        5. Pinch - two-finger zoom in/out (if applicable)
-        6. Rotation - two-finger circular motion (if applicable)
+        Your plan should have TWO distinct phases:
+        
+        PHASE 1: MECHANICS EXPLORATION (first 30-40% of steps)
+        - Begin with basic observation steps to understand the current game state
+        - Try each primary input/action in isolation to observe its effects
+        - Experiment with combinations of successful actions
+        - Document consistent patterns of what works and what doesn't
+        - Form hypotheses about the game's rules and constraints
+        
+        PHASE 2: TARGETED TESTING (remaining 60-70% of steps)
+        - Based on the mechanics learned in Phase 1, design specific tests for the feature
+        - Include edge cases that might reveal bugs while respecting valid game constraints
+        - Test boundary conditions where mechanics might break down
+        - Verify that the game's stated objectives can be achieved
+        - Check for inconsistencies in rule application
+        
+        IMPORTANT: Mark steps as non-checkpoint (is_checkpoint: false) if they're exploratory and their failure might represent valid game constraints.
+        Only mark steps as checkpoints (is_checkpoint: true) if their failure would definitively indicate a bug.
         
         For each step, provide:
-        - step_id: A unique identifier
-        - action_description: Clear instruction (what touch action to perform and where)
-        - expected_observation: What should be observed
-        - success_criteria: How to determine success
-        - fallback_action: Alternative if the main action fails
-        - is_checkpoint: Whether this step is critical
+        - step_id: A unique identifier (e.g., "EXPLORE-001" or "TEST-001")
+        - action_description: Clear, specific instruction to execute
+        - expected_observation: What you expect to happen, including possible constraint-based failures
+        - success_criteria: How to determine if the step revealed useful information (not just whether the action succeeded)
+        - fallback_action: Alternative approach if the primary action doesn't produce useful results
+        - is_checkpoint: Whether this step's failure would definitively indicate a bug (use sparingly)
         
-        Format as JSON with an array of steps.
+        Format your response as a JSON object with an array of step objects under the "steps" key.
         """
+
         
         try:
             response = self.llm_client.chat.completions.create(
@@ -438,15 +457,15 @@ class InterpreterAgent:
         test_task: TestTask,
         execution_results: List[ExecutionResult]
     ) -> List[Bug]:
-        """Analyze execution results to identify bugs"""
-        self.logger.info(f"Analyzing results for task {test_task.task_id}")
+        """Analyze execution results to identify genuine bugs vs. valid game constraints"""
+        logger.info(f"Interpreter agent: Analyzing results for task {test_task.task_id}")
         
-        # Convert execution results to JSON-serializable format
-        execution_results_json = [result.to_dict() for result in execution_results]
+        # Convert execution_results to dictionaries for JSON serialization
+        execution_results_dicts = [result.to_dict() for result in execution_results]
         
         prompt = f"""
-        You are an expert bug analyzer for game testing. Your task is to examine the results of a game test execution 
-        and identify any bugs, issues, or unexpected behaviors.
+        You are an expert game analyst with deep experience in understanding game mechanics across many genres. 
+        Your task is to analyze test results to identify genuine bugs while accounting for valid game constraints.
         
         Game Context:
         {game_description}
@@ -458,30 +477,36 @@ class InterpreterAgent:
         {json.dumps(test_task.to_dict(), indent=2)}
         
         Execution Results:
-        {json.dumps(execution_results_json, indent=2)}
+        {json.dumps(execution_results_dicts, indent=2)}
         
-        Conduct a thorough analysis of the execution results to identify any bugs or issues. Consider:
+        IMPORTANT: In games, unsuccessful actions are often part of valid game mechanics, not bugs.
         
-        1. Did the outcome match the expected outcome specified in the test task?
-        2. Did any steps fail or require fallback actions?
-        3. Were there differences between expected observations and actual observations?
-        4. Are there any inconsistencies in behavior across different steps?
-        5. Does the feature function as described in all tested scenarios?
-        6. Are there any performance issues, visual glitches, or other anomalies mentioned?
+        First, analyze the test results to understand the game's core mechanics and constraints:
+        1. What actions succeed or fail consistently?
+        2. Are there patterns to when actions fail?
+        3. Do the failures align with the described game mechanics?
+        4. What appears to be normal/expected behavior for this game type?
         
-        For each bug you identify, provide:
-        - bug_id: A unique identifier (e.g., "BUG-001")
-        - description: Detailed description of the bug
-        - severity: "critical", "high", "medium", or "low"
-        - reproduction_steps: Precise steps to reproduce the bug
-        - expected_behavior: What should have happened
-        - actual_behavior: What actually happened
-        - affected_tasks: IDs of the tasks affected by this bug
-        - potential_fix: Your assessment of how this might be fixed (optional)
+        Then, identify actual bugs by looking for:
+        1. Inconsistencies where similar actions in similar contexts have different outcomes
+        2. Actions that should work according to the game's rules but fail
+        3. Behavior that contradicts the stated design goals
+        4. Actions that render the game's objectives impossible to achieve
+        5. Contradictions in the game's own established rules
         
-        If no bugs are found, return an empty array.
+        For each genuine bug you identify, provide:
+        - bug_id: A unique identifier
+        - description: Detailed explanation of the bug
+        - severity: How seriously it impacts gameplay ("critical", "high", "medium", "low")
+        - reproduction_steps: Actions that reliably demonstrate the issue
+        - expected_behavior: What should happen according to game rules
+        - actual_behavior: What actually happened that contradicts game rules
+        - potential_fix: Suggested solution that respects the game's mechanics
         
-        Format your response as a JSON object with an array of bug objects under the "bugs" key.
+        If you determine that failures are valid constraints rather than bugs, return an empty array with reasoning.
+        
+        Format your response as a JSON object with an array of bug objects under the "bugs" key and optional "mechanics_insights" 
+        explaining your understanding of the game's constraints.
         """
         
         try:
@@ -524,7 +549,6 @@ class GameTestingPipeline:
     """
     Main pipeline for testing game features
     """
-    # Update your main pipeline class
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """Initialize game testing pipeline"""
         self.config = config or {}
@@ -541,8 +565,9 @@ class GameTestingPipeline:
         self.planner = HighLevelPlanner(self.llm_client)
         self.interpreter = InterpreterAgent(self.llm_client)
         
-        # Initialize SIMA
-        self.sima_agent = SIMAAgent(self.config)
+        # Initialize SIMA - ensure SIMAAgent accepts config
+        # self.sima_agent = SIMAAgent(self.config)
+        self.sima_agent = SIMACore()
         
         # Thread pool for parallel task execution
         self.max_workers = self.config.get("max_workers", 3)
@@ -710,19 +735,35 @@ def main():
             "action_space": [
                 "move", "look", "click", "interact", "use_item",
                 "attack", "jump", "open_menu", "close_menu"
-            ]
+            ],
+            "observer": {
+                "capture_method": "adb",
+                "resize_shape": (224, 224)
+            },
+            "controller": {
+                "control_method": "adb",
+                "action_delay": 0.5
+            }
+
         }
     }
     
-    # Example game and feature descriptions (replace with your own)
     game_description = """
-    This is a game where players can interact with the environment, fight enemies,
-    and complete quests. [Add your detailed game description here]
+    'Jelly Merge Puzzle' is a grid-based sliding puzzle game where jelly blocks are arranged on a square grid. Players can swipe in four directions (up, down, left, right) to slide all blocks simultaneously in that direction. Blocks move until they hit an obstacle, the edge of the grid, or another block. When two blocks collide, they combine into a single block and continue sliding together. The goal of each level is to combine all blocks into a single block through a sequence of strategic swipes. The game progresses through multiple levels with increasingly complex grid configurations and starting block arrangements.
+
+    Key mechanics:
+    1. All blocks move simultaneously when the player swipes
+    2. Blocks combine when they collide
+    3. Combined blocks continue sliding in the swipe direction
+    4. Blocks stop when hitting walls or grid edges
+    5. The win condition requires combining all blocks into a single block
+    6. Some levels have walls or blocked grid squares that affect movement
     """
-    
+
     feature_description = """
-    This feature allows players to [describe your feature here].
+    Level solvability feature: Each level in the game should be designed to have at least one valid solution where all blocks can be combined into a single block through some sequence of swipe actions. The game should not contain any levels with impossible-to-win configurations where blocks cannot all be combined regardless of the sequence of moves used.
     """
+
     
     # Initialize and run the pipeline
     try:
@@ -747,5 +788,87 @@ def main():
     except Exception as e:
         print(f"Error running the pipeline: {str(e)}")
 
+
+# Simple test script for current level
+def test_current_level():
+    # Find the connected BlueStacks device
+    device_id = None
+    try:
+        import subprocess
+        result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
+        lines = result.stdout.strip().split('\n')[1:]
+        
+        # Look for BlueStacks device (localhost)
+        for line in lines:
+            if line.strip() and "localhost" in line and "device" in line:
+                device_id = line.split()[0]
+                print(f"Found BlueStacks device: {device_id}")
+                break
+                
+        # If no BlueStacks found, use any device
+        if not device_id and lines:
+            device_id = lines[0].split()[0]
+            print(f"Using device: {device_id}")
+    except Exception as e:
+        print(f"Error finding device: {e}")
+    
+    if not device_id:
+        print("No devices found! Please make sure BlueStacks is running and ADB is connected.")
+        return
+    
+    config = {
+        "openai_api_key": os.environ.get("OPENAI_API_KEY"),
+        "max_workers": 1,
+        "sima_config": {
+            "observer": {
+                "capture_method": "adb",  # Explicit capture method
+                "resize_shape": (224, 224),
+                "device_id": device_id    # Explicitly set device ID
+            },
+            "controller": {
+                "control_method": "adb",  # Explicit control method
+                "action_delay": 0.5,
+                "device_id": device_id    # Explicitly set device ID
+            }
+        }
+    }
+    
+    # Create game descriptions
+    game_description = """
+    'Jelly Merge Puzzle' is a grid-based sliding puzzle game where jelly blocks are arranged on a square grid. Players can swipe in four directions (up, down, left, right) to slide all blocks simultaneously in that direction. Blocks move until they hit an obstacle, the edge of the grid, or another block. When two blocks collide, they combine into a single block and continue sliding together. The goal of each level is to combine all blocks into a single block through a sequence of strategic swipes.
+    """
+    
+    feature_description = """
+    Level solvability feature: Each level should be designed to have at least one valid solution where all blocks can be combined into a single block through some sequence of swipe actions. The game should not contain any levels with impossible-to-win configurations.
+    """
+    
+    # Initialize pipeline
+    pipeline = GameTestingPipeline(config)
+    
+    # Create a simple test task for the current level
+    test_task = TestTask(
+        task_id="TEST-CURRENT-LEVEL",
+        description="Test if the current level is solvable by finding a sequence of swipes that combines all blocks",
+        initial_state="Game is showing a level with jelly blocks arranged on a grid",
+        expected_outcome="All blocks can be combined into a single block through some sequence of swipes",
+        potential_bugs=["Impossible-to-win configuration", "Isolated blocks", "Blocks that cannot be combined"]
+    )
+    
+    # Run a single test on the currently visible level
+    bugs = pipeline._execute_test_task(game_description, feature_description, test_task)
+    
+    if bugs:
+        print("\n==== BUGS DETECTED ====")
+        for bug in bugs:
+            print(f"Bug ID: {bug.bug_id}")
+            print(f"Description: {bug.description}")
+            print(f"Severity: {bug.severity}")
+            print(f"Expected: {bug.expected_behavior}")
+            print(f"Actual: {bug.actual_behavior}")
+            print(f"Fix suggestion: {bug.potential_fix}\n")
+    else:
+        print("\n==== NO BUGS DETECTED ====")
+        print("The current level appears to be solvable.")
+
 if __name__ == "__main__":
-    main()
+    test_current_level()

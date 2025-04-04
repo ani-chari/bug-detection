@@ -2,6 +2,7 @@
 import torch
 import logging
 import time
+import numpy as np
 from typing import Dict, Any, List
 
 from .models.vision import VisionModel
@@ -28,14 +29,22 @@ class SIMAAgent:
     """
     
     def __init__(self, config: Dict[str, Any] = None):
-        """Initialize the SIMA agent with configuration"""
-        self.config = config or default_config()
+        self.config = config or {}
         self.logger = logging.getLogger(__name__)
         
         # Determine device
         self.device = self.config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         self.logger.info(f"Using device: {self.device}")
         
+        # Get observer configuration
+        observer_config = self.config.get("observer", {})
+        capture_method = observer_config.get("capture_method", "screen")
+        
+        # Get controller configuration  
+        controller_config = self.config.get("controller", {})
+        control_method = controller_config.get("control_method", "keyboard_mouse")
+        
+        # Initialize models
         # Initialize models
         self.vision_model = VisionModel(self.config.get("vision", {})).to(self.device)
         self.language_model = LanguageModel(self.config.get("language", {})).to(self.device)
@@ -47,10 +56,163 @@ class SIMAAgent:
             self.action_model
         ).to(self.device)
         
-        # Initialize environment interaction
-        self.observer = ScreenObserver(self.config.get("observer", {}))
-        self.controller = InputController(self.config.get("controller", {}))
-        
+        # FORCE use of ADB observer for Android regardless of config
+        # This bypasses any issues with capture_method not being set
+        try:
+            # Try to import and use ADBScreenObserver
+            try:
+                from .environment.adb_observer import ADBScreenObserver
+                self.observer = ADBScreenObserver(observer_config)
+                self.logger.info("Using ADBScreenObserver")
+            except (ImportError, ModuleNotFoundError):
+                # If import fails, define the class inline
+                self.logger.info("ADBScreenObserver not found, creating inline implementation")
+                
+                import subprocess
+                import tempfile
+                import os
+                from PIL import Image
+                
+                class InlineADBObserver:
+                    def __init__(self, config):
+                        self.config = config
+                        self.logger = logging.getLogger(__name__ + ".InlineADBObserver")
+                        self.resize_shape = config.get("resize_shape", (224, 224))
+                        self.device_id = config.get("device_id")
+                        
+                        if not self.device_id:
+                            # Find device ID
+                            try:
+                                result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
+                                lines = result.stdout.strip().split('\n')[1:]
+                                for line in lines:
+                                    if line.strip() and "device" in line:
+                                        self.device_id = line.split()[0]
+                                        break
+                            except:
+                                self.device_id = None
+                    
+                    def get_observation(self):
+                        try:
+                            # Create temp file
+                            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                                temp_path = temp_file.name
+                            
+                            # Capture screenshot
+                            if self.device_id:
+                                subprocess.run(['adb', '-s', self.device_id, 'shell', 'screencap', '-p', '/sdcard/screenshot.png'], check=True)
+                                subprocess.run(['adb', '-s', self.device_id, 'pull', '/sdcard/screenshot.png', temp_path], check=True)
+                            else:
+                                subprocess.run(['adb', 'shell', 'screencap', '-p', '/sdcard/screenshot.png'], check=True)
+                                subprocess.run(['adb', 'pull', '/sdcard/screenshot.png', temp_path], check=True)
+                            
+                            # Process image
+                            img = Image.open(temp_path).convert('RGB')
+                            img = img.resize(self.resize_shape)
+                            img_np = np.array(img)
+                            img_tensor = torch.tensor(img_np).permute(2, 0, 1).float() / 255.0
+                            
+                            # Clean up
+                            os.unlink(temp_path)
+                            
+                            return img_tensor
+                        except Exception as e:
+                            self.logger.error(f"Error capturing screenshot: {e}")
+                            blank = np.zeros((self.resize_shape[1], self.resize_shape[0], 3), dtype=np.uint8)
+                            return torch.tensor(blank).permute(2, 0, 1).float() / 255.0
+                
+                self.observer = InlineADBObserver(observer_config)
+                
+        except Exception as e:
+            self.logger.error(f"Error initializing observer: {e}")
+            # Set up a mock observer as fallback
+            self.observer = None
+            
+        # Similarly force use of ADB controller
+        try:
+            # Try to import and use ADBInputController
+            try:
+                from .environment.adb_controller import ADBInputController
+                self.controller = ADBInputController(controller_config)
+                self.logger.info("Using ADBInputController")
+            except (ImportError, ModuleNotFoundError):
+                # Implement inline ADB controller
+                self.logger.info("ADBInputController not found, creating inline implementation")
+                
+                class InlineADBController:
+                    def __init__(self, config):
+                        self.config = config
+                        self.logger = logging.getLogger(__name__ + ".InlineADBController")
+                        self.device_id = config.get("device_id")
+                        self.action_delay = config.get("action_delay", 0.5)
+                        
+                        if not self.device_id:
+                            # Find device ID
+                            try:
+                                result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
+                                lines = result.stdout.strip().split('\n')[1:]
+                                for line in lines:
+                                    if line.strip() and "device" in line:
+                                        self.device_id = line.split()[0]
+                                        break
+                            except:
+                                self.device_id = None
+                    
+                    def execute(self, actions):
+                        results = []
+                        success = True
+                        
+                        for action in actions:
+                            try:
+                                action_type = action.get("type", "")
+                                
+                                if action_type == "touch" and action.get("action") == "tap":
+                                    pos = action.get("position", {"x": 0.5, "y": 0.5})
+                                    x, y = pos.get("x", 0.5), pos.get("y", 0.5)
+                                    # Convert to screen coordinates (assuming 1080x1920)
+                                    sx, sy = int(x * 1080), int(y * 1920)
+                                    
+                                    if self.device_id:
+                                        subprocess.run(['adb', '-s', self.device_id, 'shell', 'input', 'tap', str(sx), str(sy)], check=True)
+                                    else:
+                                        subprocess.run(['adb', 'shell', 'input', 'tap', str(sx), str(sy)], check=True)
+                                    
+                                    results.append({"success": True, "type": "touch", "action": "tap"})
+                                    
+                                elif action_type == "swipe":
+                                    start = action.get("start", {"x": 0.5, "y": 0.7})
+                                    end = action.get("end", {"x": 0.5, "y": 0.3})
+                                    
+                                    # Convert to screen coordinates
+                                    sx1, sy1 = int(start.get("x", 0.5) * 1080), int(start.get("y", 0.5) * 1920)
+                                    sx2, sy2 = int(end.get("x", 0.5) * 1080), int(end.get("y", 0.5) * 1920)
+                                    
+                                    if self.device_id:
+                                        subprocess.run(['adb', '-s', self.device_id, 'shell', 'input', 'swipe', 
+                                                      str(sx1), str(sy1), str(sx2), str(sy2)], check=True)
+                                    else:
+                                        subprocess.run(['adb', 'shell', 'input', 'swipe', 
+                                                      str(sx1), str(sy1), str(sx2), str(sy2)], check=True)
+                                    
+                                    results.append({"success": True, "type": "swipe"})
+                                else:
+                                    results.append({"success": False, "message": f"Unsupported action: {action_type}"})
+                                    success = False
+                                
+                                time.sleep(self.action_delay)
+                                
+                            except Exception as e:
+                                self.logger.error(f"Error executing action: {e}")
+                                results.append({"success": False, "message": str(e)})
+                                success = False
+                        
+                        return {"success": success, "actions": results}
+                
+                self.controller = InlineADBController(controller_config)
+        except Exception as e:
+            self.logger.error(f"Error initializing controller: {e}")
+            self.controller = None
+            
         self.logger.info("SIMA agent initialized successfully")
     
     def execute_action(self, action_description: str) -> Dict[str, Any]:
@@ -119,27 +281,6 @@ class SIMAAgent:
     
     def _process_instruction(self, instruction: str, observation: torch.Tensor) -> Dict[str, Any]:
         """Process an instruction and observation to generate an action plan"""
-        # Encode the instruction
-        instruction_embedding = self.language_model(instruction)
-        
-        # Encode the observation
-        visual_embedding = self.vision_model(observation)
-        
-        # Integrate vision and language to generate action plan
-        action_plan = self.integration_model(visual_embedding, instruction_embedding)
-        
-        # Calculate visual change expected
-        visual_change = self._calculate_expected_visual_change(instruction)
-        
-        return {
-            "action_plan": action_plan,
-            "visual_embedding": visual_embedding,
-            "instruction_embedding": instruction_embedding,
-            "visual_change": visual_change
-        }
-    
-    def _process_instruction(self, instruction: str, observation: torch.Tensor) -> Dict[str, Any]:
-        """Process an instruction and observation to generate an action plan"""
         # Use torch.no_grad() to prevent gradient tracking during inference
         with torch.no_grad():
             # Encode the instruction
@@ -160,7 +301,7 @@ class SIMAAgent:
             "instruction_embedding": instruction_embedding.detach(),  # Ensure tensor is detached
             "visual_change": visual_change
         }
-
+    
     def _evaluate_success(
         self, 
         initial_obs: torch.Tensor,
@@ -227,7 +368,6 @@ class SIMAAgent:
         # Generic success message
         return f"Action '{instruction}' was executed successfully."
     
-
     def _calculate_expected_visual_change(self, instruction: str) -> float:
         """
         Calculate expected visual change for an instruction.
@@ -270,4 +410,3 @@ class SIMAAgent:
         
         # Default - medium expectation
         return 0.3
-
