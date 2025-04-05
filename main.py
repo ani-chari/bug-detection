@@ -351,6 +351,271 @@ class TesterAgent:
             self.logger.error(f"Failed to generate test tasks: {e}")
             return []
 
+class AdaptivePlanner:
+    """
+    Planner that generates actions adaptively based on observed game state
+    """
+    def __init__(self, llm_client: OpenAI):
+        self.llm_client = llm_client
+        self.logger = logging.getLogger(__name__ + ".AdaptivePlanner")
+        self.action_history = []
+        self.exploration_phase = True
+        self.exploration_budget = 5  # Number of initial exploration moves
+        
+    def reset(self):
+        """Reset the planner state for a new test"""
+        self.action_history = []
+        self.exploration_phase = True
+        
+    def plan_next_action(
+        self, 
+        game_description: str, 
+        feature_description: str, 
+        test_task: TestTask,
+        current_observation: str,
+        execution_results: List[ExecutionResult] = None
+    ) -> ActionStep:
+        """Plan the next action based on current game state and history"""
+        
+        # Check if we should transition from exploration to exploitation
+        if self.exploration_phase and len(self.action_history) >= self.exploration_budget:
+            self.exploration_phase = False
+            self.logger.info("Switching from exploration to exploitation phase")
+        
+        # Build action history summary
+        action_history_summary = self._build_action_history_summary()
+        
+        # Generate prompt based on current phase
+        if self.exploration_phase:
+            prompt = self._generate_exploration_prompt(
+                game_description,
+                feature_description,
+                test_task,
+                current_observation,
+                action_history_summary
+            )
+        else:
+            prompt = self._generate_exploitation_prompt(
+                game_description,
+                feature_description,
+                test_task,
+                current_observation,
+                action_history_summary
+            )
+        
+        # Generate next action using LLM
+        try:
+            response = self.llm_client.chat.completions.create(
+                model="o3-mini",
+                messages=[
+                    {"role": "system", "content": "You are an adaptive game testing AI that plans one action at a time"},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"}
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            
+            # Create an ActionStep object
+            step_id = f"{'EXPLORE' if self.exploration_phase else 'TEST'}-{len(self.action_history) + 1:03d}"
+            action_step = ActionStep(
+                step_id=step_id,
+                action_description=result.get("action_description", ""),
+                expected_observation=result.get("expected_observation", ""),
+                success_criteria=result.get("success_criteria", ""),
+                fallback_action=result.get("fallback_action"),
+                is_checkpoint=result.get("is_checkpoint", False)
+            )
+            
+            # Store the action in history with its JSON representation
+            self.action_history.append({
+                "step": action_step,
+                "action": result.get("action", {}),
+                "phase": "exploration" if self.exploration_phase else "exploitation"
+            })
+            
+            self.logger.info(f"Generated next action: {action_step.action_description}")
+            return action_step
+            
+        except Exception as e:
+            self.logger.error(f"Failed to generate next action: {e}")
+            
+            # Fallback to a basic action if generation fails
+            return self._generate_fallback_action()
+    
+    def _generate_fallback_action(self) -> ActionStep:
+        """Generate a fallback action if LLM generation fails"""
+        step_id = f"{'EXPLORE' if self.exploration_phase else 'TEST'}-{len(self.action_history) + 1:03d}"
+        
+        # Try different directions in sequence
+        directions = [
+            {"type": "swipe", "start": {"x": 0.3, "y": 0.5}, "end": {"x": 0.7, "y": 0.5}},  # Right
+            {"type": "swipe", "start": {"x": 0.7, "y": 0.5}, "end": {"x": 0.3, "y": 0.5}},  # Left
+            {"type": "swipe", "start": {"x": 0.5, "y": 0.7}, "end": {"x": 0.5, "y": 0.3}},  # Up
+            {"type": "swipe", "start": {"x": 0.5, "y": 0.3}, "end": {"x": 0.5, "y": 0.7}}   # Down
+        ]
+        
+        direction_idx = len(self.action_history) % len(directions)
+        direction_name = ["right", "left", "up", "down"][direction_idx]
+        
+        fallback_action = ActionStep(
+            step_id=step_id,
+            action_description=f"Swipe {direction_name}",
+            expected_observation="Blocks may move if not obstructed",
+            success_criteria="Action executed successfully",
+            fallback_action=None,
+            is_checkpoint=False
+        )
+        
+        # Add to history
+        self.action_history.append({
+            "step": fallback_action,
+            "action": directions[direction_idx],
+            "phase": "exploration" if self.exploration_phase else "exploitation"
+        })
+        
+        return fallback_action
+    
+    def _build_action_history_summary(self) -> str:
+        """Build a summary of actions taken so far and their results"""
+        if not self.action_history:
+            return "No actions have been taken yet."
+        
+        summary = "Actions taken so far:\n"
+        for i, entry in enumerate(self.action_history):
+            action_step = entry["step"]
+            result = entry.get("result", {})
+            
+            summary += f"{i+1}. {action_step.action_description}"
+            
+            if "success" in result:
+                outcome = "succeeded" if result["success"] else "failed"
+                summary += f" - {outcome}"
+                
+                if "observation" in result:
+                    summary += f": {result['observation']}"
+            
+            summary += "\n"
+        
+        return summary
+    
+    def _generate_exploration_prompt(
+        self, 
+        game_description: str, 
+        feature_description: str, 
+        test_task: TestTask,
+        current_observation: str,
+        action_history_summary: str
+    ) -> str:
+        """Generate a prompt for the exploration phase"""
+        
+        return f"""
+        You are an expert game tester exploring a puzzle game to understand its mechanics.
+        
+        Game Context:
+        {game_description}
+        
+        Feature Being Tested:
+        {feature_description}
+        
+        Test Task:
+        {json.dumps(test_task.to_dict(), indent=2)}
+        
+        Current Game State:
+        {current_observation}
+        
+        Action History:
+        {action_history_summary}
+        
+        You are in the EXPLORATION PHASE. Your goal is to understand the game mechanics by trying different actions.
+        Plan a SINGLE next action that helps you learn about how the game works.
+        
+        Provide your response as a JSON object with these fields:
+        - action: A JSON object specifying exactly what to do using this format:
+          {{
+            "type": "swipe",
+            "start": {{"x": 0.7, "y": 0.5}},  // Starting point (normalized coordinates 0-1)
+            "end": {{"x": 0.3, "y": 0.5}},    // Ending point (normalized coordinates 0-1)
+            "duration": 0.3
+          }}
+        - action_description: A clear description of what this action does and why you chose it
+        - expected_observation: What you expect to happen when this action is performed
+        - success_criteria: How to determine if this action revealed useful information
+        - fallback_action: An alternative action if this one fails
+        - is_checkpoint: false (exploration actions are never checkpoints)
+        
+        IMPORTANT: Use these coordinates for different swipe directions:
+        - Left swipe: start {{"x": 0.7, "y": 0.5}}, end {{"x": 0.3, "y": 0.5}}
+        - Right swipe: start {{"x": 0.3, "y": 0.5}}, end {{"x": 0.7, "y": 0.5}}
+        - Up swipe: start {{"x": 0.5, "y": 0.7}}, end {{"x": 0.5, "y": 0.3}}
+        - Down swipe: start {{"x": 0.5, "y": 0.3}}, end {{"x": 0.5, "y": 0.7}}
+        """
+    
+    def _generate_exploitation_prompt(
+        self, 
+        game_description: str, 
+        feature_description: str, 
+        test_task: TestTask,
+        current_observation: str,
+        action_history_summary: str
+    ) -> str:
+        """Generate a prompt for the exploitation phase"""
+        
+        return f"""
+        You are an expert game tester trying to solve a puzzle game and identify any bugs.
+        
+        Game Context:
+        {game_description}
+        
+        Feature Being Tested:
+        {feature_description}
+        
+        Test Task:
+        {json.dumps(test_task.to_dict(), indent=2)}
+        
+        Current Game State:
+        {current_observation}
+        
+        Action History:
+        {action_history_summary}
+        
+        You are in the EXPLOITATION PHASE. Based on what you've learned about the game mechanics,
+        your goal is now to strategically test if the level is solvable or has bugs.
+        
+        Plan a SINGLE next action that:
+        1. Makes progress toward combining blocks into a single one
+        2. Tests if certain block arrangements create unsolvable situations
+        3. Verifies whether all blocks can eventually be combined
+        
+        Provide your response as a JSON object with these fields:
+        - action: A JSON object specifying exactly what to do using this format:
+          {{
+            "type": "swipe",
+            "start": {{"x": 0.7, "y": 0.5}},  // Starting point (normalized coordinates 0-1)
+            "end": {{"x": 0.3, "y": 0.5}},    // Ending point (normalized coordinates 0-1)
+            "duration": 0.3
+          }}
+        - action_description: A clear description of what this action does and your strategy
+        - expected_observation: What you expect to happen when this action is performed
+        - success_criteria: How to determine if this action revealed useful information
+        - fallback_action: An alternative action if this one fails
+        - is_checkpoint: Whether this step's failure would indicate a bug (use sparingly)
+        
+        IMPORTANT: Use these coordinates for different swipe directions:
+        - Left swipe: start {{"x": 0.7, "y": 0.5}}, end {{"x": 0.3, "y": 0.5}}
+        - Right swipe: start {{"x": 0.3, "y": 0.5}}, end {{"x": 0.7, "y": 0.5}}
+        - Up swipe: start {{"x": 0.5, "y": 0.7}}, end {{"x": 0.5, "y": 0.3}}
+        - Down swipe: start {{"x": 0.5, "y": 0.3}}, end {{"x": 0.5, "y": 0.7}}
+        """
+    
+    def update_action_result(self, step_id: str, result: Dict[str, Any]):
+        """Update the history with the result of an action"""
+        for entry in self.action_history:
+            if entry["step"].step_id == step_id:
+                entry["result"] = result
+                break
+        else:
+            raise ValueError(f"Step {step_id} not found in action history")
 
 class HighLevelPlanner:
     """
@@ -404,7 +669,32 @@ class HighLevelPlanner:
         - fallback_action: Alternative approach if the primary action doesn't produce useful results
         - is_checkpoint: Whether this step's failure would definitively indicate a bug (use sparingly)
         
-        Format your response as a JSON object with an array of step objects under the "steps" key.
+        Create a sequence of steps that tests whether this level is solvable. Each step must include an 
+        ACTION property that is a JSON object with the following format:
+        
+        For swipes:
+        {{
+        "type": "swipe",
+        "start": {{"x": 0.5, "y": 0.7}},  // Normalized coordinates (0-1)
+        "end": {{"x": 0.5, "y": 0.3}},
+        "duration": 0.3
+        }}
+        
+        For taps:
+        {{
+        "type": "touch",
+        "action": "tap",
+        "position": {{"x": 0.5, "y": 0.5}}  // Normalized coordinates (0-1)
+        }}
+        
+        For each step, provide:
+        - step_id: A unique identifier
+        - description: Human-readable explanation of this step
+        - action: JSON object in one of the formats above
+        - expected_result: What should happen when this action is performed
+        - is_checkpoint: Whether this step's failure indicates a bug
+        
+        Format your response as a JSON object with an array of step objects.
         """
 
         
@@ -660,6 +950,188 @@ class GameTestingPipeline:
         
         return bugs
     
+    def _execute_test_task_adaptive(
+        self, 
+        game_description: str, 
+        feature_description: str, 
+        test_task: TestTask
+    ) -> List[Bug]:
+        """Execute a test task using the adaptive planner with feedback loop"""
+        self.logger.info(f"Executing test task {test_task.task_id} adaptively: {test_task.description}")
+        
+        # Initialize the adaptive planner
+        adaptive_planner = AdaptivePlanner(self.llm_client)
+        adaptive_planner.reset()
+        
+        # Initialize execution results
+        execution_results = []
+        
+        # Maximum number of steps to prevent infinite loops
+        max_steps = 20
+        
+        # Execute steps adaptively
+        for step_num in range(max_steps):
+            # Get current observation (screenshot + description)
+            current_observation = self._get_current_observation()
+            
+            # Plan next action based on current state
+            action_step = adaptive_planner.plan_next_action(
+                game_description,
+                feature_description,
+                test_task,
+                current_observation,
+                execution_results
+            )
+            
+            # Extract the action JSON from the planner's history
+            action_json = None
+            for entry in adaptive_planner.action_history:
+                if entry["step"].step_id == action_step.step_id:
+                    action_json = entry.get("action", {})
+                    break
+            
+            # Execute the action using the controller directly with JSON
+            self.logger.info(f"Executing step {action_step.step_id}: {action_step.action_description}")
+            
+            # Either execute via SIMA or directly via controller
+            if action_json and self.sima_agent and hasattr(self.sima_agent, "controller"):
+                # Execute directly with controller
+                controller_result = self.sima_agent.controller.execute([action_json])
+                result = {
+                    "success": controller_result.get("success", False),
+                    "observation": f"Executed {action_json.get('type', 'unknown')} action",
+                    "raw_data": controller_result
+                }
+            else:
+                # Fall back to traditional execution
+                result = self.sima_agent.execute_action(action_step.action_description)
+            
+            # Get updated observation after action
+            post_action_observation = self._get_current_observation()
+            
+            # Create execution result
+            execution_result = ExecutionResult(
+                step_id=action_step.step_id,
+                action_description=action_step.action_description,
+                observation=post_action_observation,
+                success=result.get("success", False),
+                raw_data=result
+            )
+            
+            # Update planner with the result
+            adaptive_planner.update_action_result(action_step.step_id, {
+                "success": execution_result.success,
+                "observation": execution_result.observation
+            })
+            
+            # Add to execution results
+            execution_results.append(execution_result)
+            
+            # Handle failures
+            if not execution_result.success:
+                self.logger.warning(f"Step {action_step.step_id} failed")
+                
+                # Checkpoint failures abort the plan
+                if action_step.is_checkpoint:
+                    self.logger.warning(f"Checkpoint step {action_step.step_id} failed. Aborting plan.")
+                    break
+                
+                # Try fallback action if available
+                if action_step.fallback_action:
+                    # Execute fallback logic
+                    # (Similar to above execution logic)
+                    pass
+            
+            # Check if we've completed the task (combined all blocks or determined impossible)
+            if self._is_task_complete(execution_results, test_task):
+                self.logger.info(f"Task {test_task.task_id} completed successfully")
+                break
+        
+        # Analyze results to find bugs
+        bugs = self.interpreter.analyze_results(
+            game_description,
+            feature_description,
+            test_task,
+            execution_results
+        )
+        
+        return bugs
+
+    def _get_current_observation(self) -> str:
+        """Get a description of the current game state"""
+        try:
+            # Use LLM to describe the current screenshot
+            if hasattr(self.sima_agent, "observer") and self.sima_agent.observer:
+                # Get screenshot
+                screenshot = self.sima_agent.observer.get_observation()
+                
+                # Analyze screenshot using OpenAI Vision API
+                import base64
+                from io import BytesIO
+                
+                # Convert tensor to PIL Image
+                from torchvision.transforms import ToPILImage
+                transform = ToPILImage()
+                pil_image = transform(screenshot)
+                
+                # Convert to base64 for API
+                buffered = BytesIO()
+                pil_image.save(buffered, format="JPEG")
+                img_str = base64.b64encode(buffered.getvalue()).decode()
+                
+                prompt = """
+                Analyze this jelly block puzzle game screenshot. Describe:
+                1. The grid layout
+                2. The number and position of blocks
+                3. Any obstacles or walls
+                4. The potential moves (which directions blocks could slide)
+                """
+                
+                # Call Vision API
+                try:
+                    response = self.llm_client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {"role": "user", "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}}
+                            ]}
+                        ],
+                        max_tokens=300
+                    )
+                    return response.choices[0].message.content
+                except Exception as e:
+                    self.logger.error(f"Error analyzing screenshot: {e}")
+                    return "Game screen shows a puzzle with jelly blocks on a grid."
+            else:
+                return "Current game state unknown."
+        except Exception as e:
+            self.logger.error(f"Error getting current observation: {e}")
+            return "Unable to capture current game state."
+
+    def _is_task_complete(self, execution_results: List[ExecutionResult], test_task: TestTask) -> bool:
+        """Check if the task has been completed based on recent observations"""
+        # For the jelly block game, check if:
+        # 1. We've reached a single block (success)
+        # 2. We've determined it's impossible (task complete, but with bug)
+        
+        if len(execution_results) >= 3:
+            last_three = execution_results[-3:]
+            
+            # Check for win condition
+            for result in last_three:
+                if any(phrase in result.observation.lower() for phrase in 
+                    ["all blocks combined", "single block", "level completed", "level solved"]):
+                    return True
+                    
+            # Check for deadlock determination
+            if all(phrase in execution_results[-1].observation.lower() for phrase in 
+                ["impossible", "unsolvable", "cannot be combined"]):
+                return True
+                
+        return False
+
+    
     def _execute_action_plan(self, action_plan: List[ActionStep]) -> List[ExecutionResult]:
         """Execute an action plan using the SIMA agent"""
         self.logger.info(f"Executing action plan with {len(action_plan)} steps")
@@ -789,51 +1261,39 @@ def main():
         print(f"Error running the pipeline: {str(e)}")
 
 
-# Simple test script for current level
 def test_current_level():
-    # Find the connected BlueStacks device
+    """Test the currently visible level using adaptive planning"""
     device_id = None
     try:
-        import subprocess
         result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
         lines = result.stdout.strip().split('\n')[1:]
         
-        # Look for BlueStacks device (localhost)
         for line in lines:
             if line.strip() and "localhost" in line and "device" in line:
                 device_id = line.split()[0]
                 print(f"Found BlueStacks device: {device_id}")
                 break
-                
-        # If no BlueStacks found, use any device
-        if not device_id and lines:
-            device_id = lines[0].split()[0]
-            print(f"Using device: {device_id}")
     except Exception as e:
         print(f"Error finding device: {e}")
-    
-    if not device_id:
-        print("No devices found! Please make sure BlueStacks is running and ADB is connected.")
-        return
     
     config = {
         "openai_api_key": os.environ.get("OPENAI_API_KEY"),
         "max_workers": 1,
         "sima_config": {
             "observer": {
-                "capture_method": "adb",  # Explicit capture method
+                "capture_method": "adb",
                 "resize_shape": (224, 224),
-                "device_id": device_id    # Explicitly set device ID
+                "device_id": device_id
             },
             "controller": {
-                "control_method": "adb",  # Explicit control method
+                "control_method": "adb",
                 "action_delay": 0.5,
-                "device_id": device_id    # Explicitly set device ID
+                "device_id": device_id
             }
         }
     }
     
-    # Create game descriptions
+    # Game descriptions
     game_description = """
     'Jelly Merge Puzzle' is a grid-based sliding puzzle game where jelly blocks are arranged on a square grid. Players can swipe in four directions (up, down, left, right) to slide all blocks simultaneously in that direction. Blocks move until they hit an obstacle, the edge of the grid, or another block. When two blocks collide, they combine into a single block and continue sliding together. The goal of each level is to combine all blocks into a single block through a sequence of strategic swipes.
     """
@@ -854,8 +1314,8 @@ def test_current_level():
         potential_bugs=["Impossible-to-win configuration", "Isolated blocks", "Blocks that cannot be combined"]
     )
     
-    # Run a single test on the currently visible level
-    bugs = pipeline._execute_test_task(game_description, feature_description, test_task)
+    # Run the adaptive test
+    bugs = pipeline._execute_test_task_adaptive(game_description, feature_description, test_task)
     
     if bugs:
         print("\n==== BUGS DETECTED ====")

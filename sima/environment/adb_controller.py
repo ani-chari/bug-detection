@@ -125,3 +125,76 @@ class ADBInputController:
                 success = False
         
         return {"success": success, "actions": results}
+    
+
+class SimpleGameController:
+    def __init__(self, config):
+        self.config = config
+        self.device_id = config.get("device_id")
+        self.logger = logging.getLogger(__name__)
+        self.action_delay = config.get("action_delay", 0.5)
+        
+    def execute(self, actions):
+        """Execute a list of actions"""
+        if not isinstance(actions, list):
+            actions = [actions]  # Convert single action to list
+            
+        results = []
+        success = True
+        
+        for action in actions:
+            try:
+                action_type = action.get("type", "")
+                
+                if action_type == "swipe":
+                    start = action.get("start", {})
+                    end = action.get("end", {})
+                    self._execute_swipe(
+                        start_x=start.get("x", 0.5), 
+                        start_y=start.get("y", 0.5),
+                        end_x=end.get("x", 0.5), 
+                        end_y=end.get("y", 0.5)
+                    )
+                    results.append({"success": True, "type": "swipe"})
+                    
+                elif action_type == "touch" and action.get("action") == "tap":
+                    pos = action.get("position", {})
+                    self._execute_tap(x=pos.get("x", 0.5), y=pos.get("y", 0.5))
+                    results.append({"success": True, "type": "touch", "action": "tap"})
+                    
+                else:
+                    results.append({"success": False, "message": f"Unsupported action: {action_type}"})
+                    success = False
+                
+                time.sleep(self.action_delay)
+                
+            except Exception as e:
+                self.logger.error(f"Error executing action: {e}")
+                results.append({"success": False, "message": str(e)})
+                success = False
+        
+        return {"success": success, "actions": results}
+    
+    def _execute_swipe(self, start_x, start_y, end_x, end_y):
+        """Execute a swipe action using ADB"""
+        print(start_x, start_y, end_x, end_y)
+        sx1, sy1 = int(start_x * 1080), int(start_y * 1920)
+        sx2, sy2 = int(end_x * 1080), int(end_y * 1920)
+        
+        cmd = ['adb']
+        if self.device_id:
+            cmd.extend(['-s', self.device_id])
+        cmd.extend(['shell', 'input', 'swipe', str(sx1), str(sy1), str(sx2), str(sy2)])
+        
+        subprocess.run(cmd, check=True)
+    
+    def _execute_tap(self, x, y):
+        """Execute a tap action using ADB"""
+        sx, sy = int(x * 1080), int(y * 1920)
+        
+        cmd = ['adb']
+        if self.device_id:
+            cmd.extend(['-s', self.device_id])
+        cmd.extend(['shell', 'input', 'tap', str(sx), str(sy)])
+        
+        subprocess.run(cmd, check=True)

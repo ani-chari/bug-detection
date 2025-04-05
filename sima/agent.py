@@ -132,8 +132,9 @@ class SIMAAgent:
         try:
             # Try to import and use ADBInputController
             try:
-                from .environment.adb_controller import ADBInputController
-                self.controller = ADBInputController(controller_config)
+                # from .environment.adb_controller import ADBInputController
+                from .environment.adb_controller import SimpleGameController
+                self.controller = SimpleGameController(controller_config)
                 self.logger.info("Using ADBInputController")
             except (ImportError, ModuleNotFoundError):
                 # Implement inline ADB controller
@@ -291,6 +292,7 @@ class SIMAAgent:
             
             # Integrate vision and language to generate action plan
             action_plan = self.integration_model(visual_embedding, instruction_embedding)
+            print("ACTION PLAN", action_plan)
         
         # Calculate visual change expected
         visual_change = self._calculate_expected_visual_change(instruction)
