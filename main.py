@@ -747,15 +747,34 @@ class InterpreterAgent:
         test_task: TestTask,
         execution_results: List[ExecutionResult]
     ) -> List[Bug]:
-        """Analyze execution results to identify genuine bugs vs. valid game constraints"""
+        """Analyze execution results with enhanced focus on block isolation patterns"""
         logger.info(f"Interpreter agent: Analyzing results for task {test_task.task_id}")
         
         # Convert execution_results to dictionaries for JSON serialization
         execution_results_dicts = [result.to_dict() for result in execution_results]
         
+        # Extract observations to create a game state timeline
+        observations = [result.observation for result in execution_results]
+        
+        # Count the number of actions in each direction
+        action_counts = {
+            "left": 0, "right": 0, "up": 0, "down": 0
+        }
+        
+        for result in execution_results:
+            action_desc = result.action_description.lower()
+            if "left" in action_desc:
+                action_counts["left"] += 1
+            elif "right" in action_desc:
+                action_counts["right"] += 1
+            elif "up" in action_desc:
+                action_counts["up"] += 1
+            elif "down" in action_desc:
+                action_counts["down"] += 1
+        
         prompt = f"""
-        You are an expert game analyst with deep experience in understanding game mechanics across many genres. 
-        Your task is to analyze test results to identify genuine bugs while accounting for valid game constraints.
+        You are an expert analyst specializing in puzzle game mechanics. Your task is to determine if the current level
+        of a jelly block sliding puzzle game is solvable or contains a bug making it impossible to win.
         
         Game Context:
         {game_description}
@@ -766,44 +785,68 @@ class InterpreterAgent:
         Test Task:
         {json.dumps(test_task.to_dict(), indent=2)}
         
+        Testing Details:
+        - We've performed {len(execution_results)} actions on this level
+        - Actions by direction: {json.dumps(action_counts)}
+        
+        PLEASE ANALYZE THE GAME STATE OBSERVATIONS CAREFULLY for evidence of blocks being permanently isolated:
+        
+        Timeline of observations:
+        {json.dumps(observations, indent=2)}
+        
         Execution Results:
         {json.dumps(execution_results_dicts, indent=2)}
         
-        IMPORTANT: In games, unsuccessful actions are often part of valid game mechanics, not bugs.
+        CRUCIAL ANALYSIS QUESTIONS:
         
-        First, analyze the test results to understand the game's core mechanics and constraints:
-        1. What actions succeed or fail consistently?
-        2. Are there patterns to when actions fail?
-        3. Do the failures align with the described game mechanics?
-        4. What appears to be normal/expected behavior for this game type?
+        1. ISOLATION ANALYSIS:
+        - Are there blocks that appear to be permanently separated by walls or obstacles?
+        - Are there blocks in separate "chambers" with no connecting path between them?
+        - Does the grid structure prevent certain blocks from ever meeting?
         
-        Then, identify actual bugs by looking for:
-        1. Inconsistencies where similar actions in similar contexts have different outcomes
-        2. Actions that should work according to the game's rules but fail
-        3. Behavior that contradicts the stated design goals
-        4. Actions that render the game's objectives impossible to achieve
-        5. Contradictions in the game's own established rules
+        2. MOVEMENT PATTERN ANALYSIS:
+        - Have we tried all four directions (up, down, left, right) multiple times?
+        - Do blocks stop moving in certain directions due to walls/obstacles?
+        - Are there blocks that never change position despite multiple swipe attempts?
         
-        For each genuine bug you identify, provide:
+        3. MATHEMATICAL POSSIBILITY:
+        - Based on the grid layout and block positions, is it theoretically possible to combine all blocks?
+        - Are there subgroups of blocks that can combine within themselves but cannot merge with other subgroups?
+        - Is there a path that would allow all blocks to eventually meet?
+        
+        4. WIN CONDITION ASSESSMENT:
+        - Has the level already been completed (all blocks merged into one)?
+        - If not, is there a clear strategy to combine all remaining blocks?
+        - Is there mathematical proof that the remaining configuration cannot be solved?
+        
+        IMPORTANT: A level is UNSOLVABLE if and only if there is a MATHEMATICAL CERTAINTY that blocks cannot all be combined,
+        not just because our specific sequence of moves didn't solve it.
+        
+        For each bug you identify, provide:
         - bug_id: A unique identifier
-        - description: Detailed explanation of the bug
-        - severity: How seriously it impacts gameplay ("critical", "high", "medium", "low")
-        - reproduction_steps: Actions that reliably demonstrate the issue
-        - expected_behavior: What should happen according to game rules
-        - actual_behavior: What actually happened that contradicts game rules
-        - potential_fix: Suggested solution that respects the game's mechanics
+        - description: Detailed explanation of why the level is unsolvable with specific reference to block positions
+        - severity: How seriously it impacts gameplay ("critical" for unsolvable levels)
+        - reproduction_steps: Which level configuration demonstrates this isolation bug
+        - expected_behavior: All blocks should be combinable into one
+        - actual_behavior: Detailed explanation of the isolation pattern making combining impossible
+        - potential_fix: Suggested modifications to make the level solvable
         
-        If you determine that failures are valid constraints rather than bugs, return an empty array with reasoning.
+        If the level is solvable (no bugs), explain why and provide:
+        - A clear explanation of why blocks can be combined
+        - Which moves would lead to a solution
+        - If the level has already been solved
         
-        Format your response as a JSON object with an array of bug objects under the "bugs" key and optional "mechanics_insights" 
-        explaining your understanding of the game's constraints.
+        Format your response as a JSON object with:
+        1. An array of bug objects under the "bugs" key (empty if no bugs)
+        2. A "solvability_analysis" field explaining your reasoning about solvability
+        3. A "win_status" field indicating if the level is "solved", "solvable", or "unsolvable"
         """
         
         try:
             response = self.llm_client.chat.completions.create(
                 model="o3-mini",
                 messages=[
-                    {"role": "system", "content": "You are a specialized AI for identifying game bugs"},
+                    {"role": "system", "content": "You are a specialized AI for identifying game bugs and analyzing puzzle solvability"},
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"}
@@ -812,6 +855,12 @@ class InterpreterAgent:
             result = json.loads(response.choices[0].message.content)
             bug_dicts = result.get("bugs", [])
             
+            # Log the solvability analysis
+            solvability_analysis = result.get("solvability_analysis", "No analysis provided")
+            win_status = result.get("win_status", "unknown")
+            self.logger.info(f"Solvability analysis: {win_status}")
+            self.logger.info(f"Analysis details: {solvability_analysis[:100]}...")
+            
             # Convert dictionaries to Bug objects
             bugs = []
             for i, bug_dict in enumerate(bug_dicts):
@@ -819,7 +868,7 @@ class InterpreterAgent:
                 bugs.append(Bug(
                     bug_id=bug_id,
                     description=bug_dict.get("description", ""),
-                    severity=bug_dict.get("severity", "medium"),
+                    severity=bug_dict.get("severity", "critical"),
                     reproduction_steps=bug_dict.get("reproduction_steps", ""),
                     expected_behavior=bug_dict.get("expected_behavior", ""),
                     actual_behavior=bug_dict.get("actual_behavior", ""),
@@ -833,6 +882,7 @@ class InterpreterAgent:
         except Exception as e:
             self.logger.error(f"Failed to analyze results: {e}")
             return []
+
 
 
 class GameTestingPipeline:
@@ -1058,7 +1108,7 @@ class GameTestingPipeline:
         return bugs
 
     def _get_current_observation(self) -> str:
-        """Get a description of the current game state"""
+        """Get a detailed description of the current game state with focus on block isolation"""
         try:
             # Use LLM to describe the current screenshot
             if hasattr(self.sima_agent, "observer") and self.sima_agent.observer:
@@ -1080,11 +1130,29 @@ class GameTestingPipeline:
                 img_str = base64.b64encode(buffered.getvalue()).decode()
                 
                 prompt = """
-                Analyze this jelly block puzzle game screenshot. Describe:
-                1. The grid layout
-                2. The number and position of blocks
-                3. Any obstacles or walls
-                4. The potential moves (which directions blocks could slide)
+                Analyze this jelly block puzzle game screenshot with extreme precision. Focus on:
+                
+                1. DETAILED GRID LAYOUT:
+                - Exact dimensions (e.g., 5x5)
+                - Position of walls and obstacles
+                - Whether obstacles create separate chambers/regions
+                
+                2. BLOCK ANALYSIS:
+                - Exact number of blocks
+                - Precise position of each block (e.g., "Block 1 at position (2,3)")
+                - Whether blocks are in separate chambers/regions
+                
+                3. ISOLATION ASSESSMENT:
+                - Are any blocks permanently isolated by walls?
+                - Can all blocks potentially reach each other through some sequence of moves?
+                - Are there any mathematically impossible configurations?
+                
+                4. MOVEMENT POSSIBILITIES:
+                - Which directions would cause blocks to move (up/down/left/right)
+                - Which blocks would collide if moved in each direction
+                - What pattern of moves might lead to combining all blocks
+                
+                Provide a detailed, analytical description that would help determine if this level is solvable.
                 """
                 
                 # Call Vision API
@@ -1097,7 +1165,7 @@ class GameTestingPipeline:
                                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}}
                             ]}
                         ],
-                        max_tokens=300
+                        max_tokens=500
                     )
                     return response.choices[0].message.content
                 except Exception as e:
@@ -1109,27 +1177,83 @@ class GameTestingPipeline:
             self.logger.error(f"Error getting current observation: {e}")
             return "Unable to capture current game state."
 
+
     def _is_task_complete(self, execution_results: List[ExecutionResult], test_task: TestTask) -> bool:
-        """Check if the task has been completed based on recent observations"""
-        # For the jelly block game, check if:
-        # 1. We've reached a single block (success)
-        # 2. We've determined it's impossible (task complete, but with bug)
-        
-        if len(execution_results) >= 3:
-            last_three = execution_results[-3:]
+        """Check if the task has been completed based on recent observations and game state patterns"""
+        if not execution_results:
+            return False
             
-            # Check for win condition
-            for result in last_three:
+        # Check if we've already tried all four directions multiple times
+        action_counts = {
+            "left": 0, "right": 0, "up": 0, "down": 0
+        }
+        
+        for result in execution_results:
+            action_desc = result.action_description.lower()
+            if "left" in action_desc:
+                action_counts["left"] += 1
+            elif "right" in action_desc:
+                action_counts["right"] += 1
+            elif "up" in action_desc:
+                action_counts["up"] += 1
+            elif "down" in action_desc:
+                action_counts["down"] += 1
+        
+        # Check if we've tried each direction at least twice
+        thorough_testing = all(count >= 2 for count in action_counts.values())
+        
+        # Check last observation for signs of completion or impossibility
+        last_observation = execution_results[-1].observation.lower()
+        
+        # Solved indicators
+        solved_indicators = [
+            "all blocks combined", 
+            "single block", 
+            "level completed", 
+            "level solved",
+            "only one block remains",
+            "successfully merged all blocks"
+        ]
+        
+        # Unsolvable indicators
+        unsolvable_indicators = [
+            "impossible to combine",
+            "permanently isolated",
+            "no path between",
+            "cannot merge",
+            "separate chambers",
+            "blocks can never meet",
+            "mathematically impossible"
+        ]
+        
+        # Check for win condition (solved)
+        if any(indicator in last_observation for indicator in solved_indicators):
+            self.logger.info("Level appears to be SOLVED based on observations")
+            return True
+            
+        # Check for unsolvable condition
+        if thorough_testing and any(indicator in last_observation for indicator in unsolvable_indicators):
+            self.logger.info("Level appears to be UNSOLVABLE based on observations")
+            return True
+        
+        # Check for sequence of no changes
+        if len(execution_results) >= 5:
+            last_five = execution_results[-5:]
+            no_change_count = 0
+            
+            for result in last_five:
                 if any(phrase in result.observation.lower() for phrase in 
-                    ["all blocks combined", "single block", "level completed", "level solved"]):
-                    return True
-                    
-            # Check for deadlock determination
-            if all(phrase in execution_results[-1].observation.lower() for phrase in 
-                ["impossible", "unsolvable", "cannot be combined"]):
+                    ["no change", "nothing happened", "blocks didn't move", "remained the same"]):
+                    no_change_count += 1
+            
+            # If we've had 5 consecutive no-change observations after trying different directions
+            if no_change_count >= 5 and thorough_testing:
+                self.logger.info("Task may be complete - 5 consecutive actions with no change")
                 return True
-                
+        
+        # Not complete yet
         return False
+
 
     
     def _execute_action_plan(self, action_plan: List[ActionStep]) -> List[ExecutionResult]:
