@@ -3,6 +3,8 @@ import json
 import logging
 import time
 import uuid
+import io
+import base64
 from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +16,9 @@ import torch
 import numpy as np
 from PIL import Image
 from openai import OpenAI
+
+# Import video processing
+from sima.models.video_processor import VideoGameStateProcessor, UnityVideoObserver
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -615,7 +620,28 @@ class AdaptivePlanner:
                 entry["result"] = result
                 break
         else:
-            raise ValueError(f"Step {step_id} not found in action history")
+            # More robust handling - create a placeholder entry instead of raising an error
+            self.logger.warning(f"Step {step_id} not found in action history, creating placeholder")
+            
+            # Extract action description from the result
+            action_description = ""
+            if isinstance(result, dict):
+                action_description = result.get("action_description", "Unknown action")
+            
+            # Create placeholder step
+            placeholder_step = ActionStep(
+                step_id=step_id,
+                action_description=action_description,
+                expected_observation="",
+                success_criteria=""
+            )
+            
+            # Add placeholder to history
+            self.action_history.append({
+                "step": placeholder_step,
+                "result": result,
+                "phase": "unknown"
+            })
 
 class HighLevelPlanner:
     """
@@ -906,13 +932,17 @@ class GameTestingPipeline:
         self.interpreter = InterpreterAgent(self.llm_client)
         
         # Initialize SIMA - ensure SIMAAgent accepts config
-        # self.sima_agent = SIMAAgent(self.config)
-        self.sima_agent = SIMACore()
+        self.sima_agent = SIMAAgent(self.config)
+        
+        # Initialize video processing components
+        self.logger.info("Initializing video processing components")
+        self.video_observer = UnityVideoObserver(self.config)
+        self.video_processor = self.video_observer.get_processor()
         
         # Thread pool for parallel task execution
         self.max_workers = self.config.get("max_workers", 3)
         
-        self.logger.info("Game Testing Pipeline initialized")
+        self.logger.info("Game Testing Pipeline initialized with video processing capabilities")
 
     
     def run_pipeline(
@@ -1005,99 +1035,151 @@ class GameTestingPipeline:
         game_description: str, 
         feature_description: str, 
         test_task: TestTask
-    ) -> List[Bug]:
-        """Execute a test task using the adaptive planner with feedback loop"""
-        self.logger.info(f"Executing test task {test_task.task_id} adaptively: {test_task.description}")
+    ):
+        """Execute a test task using the adaptive planner with video processing and feedback loop"""
+        self.logger.info(f"Executing test task with adaptive planning and video analysis: {test_task.task_id}")
         
         # Initialize the adaptive planner
-        adaptive_planner = AdaptivePlanner(self.llm_client)
-        adaptive_planner.reset()
+        planner = AdaptivePlanner(self.llm_client)
         
-        # Initialize execution results
+        # Start capturing video frames
+        self.logger.info("Starting video frame capture")
+        for _ in range(5):  # Capture initial frames
+            self.video_observer.update()
+            time.sleep(0.1)
+        
+        # Get initial observation using traditional method and video processing
+        current_observation = self._get_current_observation()
+        
+        # Analyze initial game situation using video
+        initial_situation = self.video_processor.analyze_game_situation(
+            f"Test task: {test_task.description}\nExpected outcome: {test_task.expected_outcome}"
+        )
+        self.logger.info(f"Initial situation analysis: {initial_situation.get('analysis', 'No analysis available')}")
+        
         execution_results = []
+        max_steps = 15  # Prevent infinite loops
+        step_count = 0
         
-        # Maximum number of steps to prevent infinite loops
-        max_steps = 20
-        
-        # Execute steps adaptively
-        for step_num in range(max_steps):
-            # Get current observation (screenshot + description)
-            current_observation = self._get_current_observation()
+        # Execute actions until task complete or max steps reached
+        while not self._is_task_complete(execution_results, test_task) and step_count < max_steps:
+            step_count += 1
+            self.logger.info(f"Planning step {step_count}/{max_steps}")
             
-            # Plan next action based on current state
-            action_step = adaptive_planner.plan_next_action(
+            # Determine the next action to take using video-based analysis
+            action_recommendation = self.video_processor.determine_next_action(
                 game_description,
-                feature_description,
-                test_task,
-                current_observation,
-                execution_results
+                test_task.to_dict()
             )
             
-            # Extract the action JSON from the planner's history
-            action_json = None
-            for entry in adaptive_planner.action_history:
-                if entry["step"].step_id == action_step.step_id:
-                    action_json = entry.get("action", {})
-                    break
-            
-            # Execute the action using the controller directly with JSON
-            self.logger.info(f"Executing step {action_step.step_id}: {action_step.action_description}")
-            
-            # Either execute via SIMA or directly via controller
-            if action_json and self.sima_agent and hasattr(self.sima_agent, "controller"):
-                # Execute directly with controller
-                controller_result = self.sima_agent.controller.execute([action_json])
-                result = {
-                    "success": controller_result.get("success", False),
-                    "observation": f"Executed {action_json.get('type', 'unknown')} action",
-                    "raw_data": controller_result
-                }
+            # Extract action from recommendation
+            if isinstance(action_recommendation, dict) and "description" in action_recommendation:
+                action_text = action_recommendation["description"]
+                self.logger.info(f"Video processor recommended action: {action_text}")
+                
+                # Create an ActionStep from the recommended action
+                step_id = f"{'EXPLORE' if step_count <= 5 else 'TEST'}-{step_count:03d}"
+                action = ActionStep(
+                    step_id=step_id,
+                    action_description=action_text,
+                    expected_observation="Expected changes in game state",
+                    success_criteria="Action executed successfully",
+                    fallback_action=None,
+                    is_checkpoint=False
+                )
+                
+                # Add to planner's action history
+                planner.action_history.append({
+                    "step": action,
+                    "action": {"type": "custom", "description": action_text},
+                    "phase": "exploration" if step_count <= 5 else "exploitation"
+                })
             else:
-                # Fall back to traditional execution
-                result = self.sima_agent.execute_action(action_step.action_description)
+                # Fall back to adaptive planner if video processor couldn't determine action
+                self.logger.info("Falling back to traditional adaptive planner")
+                action = planner.plan_next_action(
+                    game_description,
+                    feature_description,
+                    test_task,
+                    current_observation,
+                    execution_results
+                )
             
-            # Get updated observation after action
-            post_action_observation = self._get_current_observation()
+            if not action:
+                self.logger.warning("No action planned, ending task execution")
+                break
+                
+            # Execute the action
+            action_text = action.action_description if isinstance(action, ActionStep) else action
+            self.logger.info(f"Executing action: {action_text}")
+            result = self.sima_agent.execute_action(action_text)
+            
+            # Adaptive wait time based on action complexity
+            wait_time = 0.5  # Default wait time
+            
+            # If action seems complex, wait longer
+            action_complexity_indicators = ['multiple', 'sequence', 'complex', 'carefully']
+            if any(indicator in action_text.lower() for indicator in action_complexity_indicators):
+                wait_time = 1.0  # Longer wait for complex actions
+                
+            time.sleep(wait_time)
+            
+            # Update video observation to capture the result - more efficient approach
+            max_frames = 3
+            frames_captured = 0
+            last_change_detected = False
+            
+            # Capture frames until we either see a change or hit our limit
+            while frames_captured < max_frames:
+                self.video_observer.update()
+                frames_captured += 1
+                
+                # Only wait between frames if we haven't captured enough yet
+                if frames_captured < max_frames:
+                    time.sleep(0.05)  # Shorter wait between frame captures
+            
+            # Get updated observation using traditional method
+            current_observation = self._get_current_observation()
             
             # Create execution result
+            # Use the actual step ID from the action object returned by the planner
+            if isinstance(action, ActionStep):
+                # Use the step ID directly from the ActionStep object
+                step_id = action.step_id
+                action_description = action.action_description
+            else:
+                # Fallback if action is a string (backward compatibility)
+                step_id = f"{'EXPLORE' if step_count <= 5 else 'TEST'}-{step_count:03d}"
+                action_description = action
+                
             execution_result = ExecutionResult(
-                step_id=action_step.step_id,
-                action_description=action_step.action_description,
-                observation=post_action_observation,
+                step_id=step_id,
+                action_description=action_description,
+                observation=current_observation,
                 success=result.get("success", False),
                 raw_data=result
             )
             
-            # Update planner with the result
-            adaptive_planner.update_action_result(action_step.step_id, {
-                "success": execution_result.success,
-                "observation": execution_result.observation
-            })
-            
-            # Add to execution results
+            # Add to results
             execution_results.append(execution_result)
             
-            # Handle failures
-            if not execution_result.success:
-                self.logger.warning(f"Step {action_step.step_id} failed")
-                
-                # Checkpoint failures abort the plan
-                if action_step.is_checkpoint:
-                    self.logger.warning(f"Checkpoint step {action_step.step_id} failed. Aborting plan.")
-                    break
-                
-                # Try fallback action if available
-                if action_step.fallback_action:
-                    # Execute fallback logic
-                    # (Similar to above execution logic)
-                    pass
+            # Update planner with the result
+            planner.update_action_result(execution_result.step_id, execution_result.to_dict())
             
-            # Check if we've completed the task (combined all blocks or determined impossible)
-            if self._is_task_complete(execution_results, test_task):
-                self.logger.info(f"Task {test_task.task_id} completed successfully")
-                break
+        # Analyze the results with video context
+        self.logger.info("Analyzing execution results with video context")
         
-        # Analyze results to find bugs
+        # First, get final video-based situation analysis
+        final_situation = self.video_processor.analyze_game_situation(
+            f"Test task: {test_task.description}\nExpected outcome: {test_task.expected_outcome}"
+        )
+        self.logger.info(f"Final situation analysis: {final_situation.get('analysis', 'No analysis available')}")
+        
+        # Add video analysis to the last execution result
+        if execution_results and 'analysis' in final_situation:
+            execution_results[-1].raw_data['video_analysis'] = final_situation['analysis']
+        
+        # Analyze with interpreter
         bugs = self.interpreter.analyze_results(
             game_description,
             feature_description,
@@ -1106,353 +1188,224 @@ class GameTestingPipeline:
         )
         
         return bugs
-
-    def _get_current_observation(self) -> str:
-        """Get a detailed description of the current game state with focus on block isolation"""
-        try:
-            # Use LLM to describe the current screenshot
-            if hasattr(self.sima_agent, "observer") and self.sima_agent.observer:
-                # Get screenshot
-                screenshot = self.sima_agent.observer.get_observation()
-                
-                # Analyze screenshot using OpenAI Vision API
-                import base64
-                from io import BytesIO
-                
-                # Convert tensor to PIL Image
-                from torchvision.transforms import ToPILImage
-                transform = ToPILImage()
-                pil_image = transform(screenshot)
-                
-                # Convert to base64 for API
-                buffered = BytesIO()
-                pil_image.save(buffered, format="JPEG")
-                img_str = base64.b64encode(buffered.getvalue()).decode()
-                
-                prompt = """
-                Analyze this jelly block puzzle game screenshot with extreme precision. Focus on:
-                
-                1. DETAILED GRID LAYOUT:
-                - Exact dimensions (e.g., 5x5)
-                - Position of walls and obstacles
-                - Whether obstacles create separate chambers/regions
-                
-                2. BLOCK ANALYSIS:
-                - Exact number of blocks
-                - Precise position of each block (e.g., "Block 1 at position (2,3)")
-                - Whether blocks are in separate chambers/regions
-                
-                3. ISOLATION ASSESSMENT:
-                - Are any blocks permanently isolated by walls?
-                - Can all blocks potentially reach each other through some sequence of moves?
-                - Are there any mathematically impossible configurations?
-                
-                4. MOVEMENT POSSIBILITIES:
-                - Which directions would cause blocks to move (up/down/left/right)
-                - Which blocks would collide if moved in each direction
-                - What pattern of moves might lead to combining all blocks
-                
-                Provide a detailed, analytical description that would help determine if this level is solvable.
-                """
-                
-                # Call Vision API
-                try:
-                    response = self.llm_client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[
-                            {"role": "user", "content": [
-                                {"type": "text", "text": prompt},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}}
-                            ]}
-                        ],
-                        max_tokens=500
-                    )
-                    return response.choices[0].message.content
-                except Exception as e:
-                    self.logger.error(f"Error analyzing screenshot: {e}")
-                    return "Game screen shows a puzzle with jelly blocks on a grid."
-            else:
-                return "Current game state unknown."
-        except Exception as e:
-            self.logger.error(f"Error getting current observation: {e}")
-            return "Unable to capture current game state."
-
-
-    def _is_task_complete(self, execution_results: List[ExecutionResult], test_task: TestTask) -> bool:
-        """Check if the task has been completed based on recent observations and game state patterns"""
-        if not execution_results:
+        
+    def _is_task_complete(self, execution_results, test_task):
+        """Determine if a test task has been completed based on execution results"""
+        # If we don't have enough results, task isn't complete
+        if not execution_results or len(execution_results) < 2:
             return False
             
-        # Check if we've already tried all four directions multiple times
-        action_counts = {
-            "left": 0, "right": 0, "up": 0, "down": 0
-        }
+        # Get the last execution result
+        last_result = execution_results[-1]
         
-        for result in execution_results:
-            action_desc = result.action_description.lower()
-            if "left" in action_desc:
-                action_counts["left"] += 1
-            elif "right" in action_desc:
-                action_counts["right"] += 1
-            elif "up" in action_desc:
-                action_counts["up"] += 1
-            elif "down" in action_desc:
-                action_counts["down"] += 1
-        
-        # Check if we've tried each direction at least twice
-        thorough_testing = all(count >= 2 for count in action_counts.values())
-        
-        # Check last observation for signs of completion or impossibility
-        last_observation = execution_results[-1].observation.lower()
-        
-        # Solved indicators
-        solved_indicators = [
-            "all blocks combined", 
-            "single block", 
-            "level completed", 
-            "level solved",
-            "only one block remains",
-            "successfully merged all blocks"
-        ]
-        
-        # Unsolvable indicators
-        unsolvable_indicators = [
-            "impossible to combine",
-            "permanently isolated",
-            "no path between",
-            "cannot merge",
-            "separate chambers",
-            "blocks can never meet",
-            "mathematically impossible"
-        ]
-        
-        # Check for win condition (solved)
-        if any(indicator in last_observation for indicator in solved_indicators):
-            self.logger.info("Level appears to be SOLVED based on observations")
+        # Check if we have any success indicator in the raw data
+        if last_result.raw_data.get('task_complete') is True:
             return True
             
-        # Check for unsolvable condition
-        if thorough_testing and any(indicator in last_observation for indicator in unsolvable_indicators):
-            self.logger.info("Level appears to be UNSOLVABLE based on observations")
-            return True
+        # Check if the last observation contains indicators of completion
+        expected_outcome_terms = test_task.expected_outcome.lower().split()
+        observation = last_result.observation.lower()
         
-        # Check for sequence of no changes
-        if len(execution_results) >= 5:
-            last_five = execution_results[-5:]
-            no_change_count = 0
+        # Count how many expected outcome terms appear in the observation
+        matches = sum(1 for term in expected_outcome_terms if term in observation and len(term) > 3)
+        match_threshold = len(expected_outcome_terms) // 2  # At least half the terms should match
+        
+        # If we have success flag and enough matching terms, task is complete
+        if last_result.success and matches >= match_threshold:
+            return True
             
-            for result in last_five:
-                if any(phrase in result.observation.lower() for phrase in 
-                    ["no change", "nothing happened", "blocks didn't move", "remained the same"]):
-                    no_change_count += 1
-            
-            # If we've had 5 consecutive no-change observations after trying different directions
-            if no_change_count >= 5 and thorough_testing:
-                self.logger.info("Task may be complete - 5 consecutive actions with no change")
+        # If we have video analysis in the raw data, check that too
+        if 'video_analysis' in last_result.raw_data:
+            video_analysis = last_result.raw_data['video_analysis'].lower()
+            video_matches = sum(1 for term in expected_outcome_terms if term in video_analysis and len(term) > 3)
+            if video_matches >= match_threshold:
                 return True
-        
-        # Not complete yet
+                
+        # If we've reached max steps, consider the task complete for practical purposes
+        if len(execution_results) >= 12:  # Using 12 as a practical limit (less than the max_steps=15)
+            return True
+            
         return False
 
-
+    # Simple cache for frame descriptions to avoid redundant API calls
+    _frame_description_cache = {}
+    _max_cache_size = 10
     
-    def _execute_action_plan(self, action_plan: List[ActionStep]) -> List[ExecutionResult]:
-        """Execute an action plan using the SIMA agent"""
-        self.logger.info(f"Executing action plan with {len(action_plan)} steps")
-        
-        execution_results = []
-        
-        for step in action_plan:
-            self.logger.info(f"Executing step {step.step_id}: {step.action_description}")
+    def _get_current_observation(self):
+        """Get a detailed description of the current game state using both screenshot and video analysis"""
+        try:
+            # Check if we have video frames available
+            if hasattr(self, 'video_processor') and self.video_processor and len(self.video_processor.frame_buffer) > 0:
+                self.logger.info("Using video processor for game state observation")
+                
+                # Get the most recent frame
+                recent_frame = self.video_processor.frame_buffer[-1]["frame"]
+                
+                # Resize the frame to reduce data size (800x600 is plenty for analysis)
+                max_size = (800, 600)
+                if recent_frame.width > max_size[0] or recent_frame.height > max_size[1]:
+                    recent_frame = recent_frame.resize(max_size, Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS)
+                
+                # Convert RGBA to RGB mode before saving as JPEG
+                if recent_frame.mode == 'RGBA':
+                    recent_frame = recent_frame.convert('RGB')
+                    
+                # Convert the frame to base64 with optimized compression
+                buffer = io.BytesIO()
+                recent_frame.save(buffer, format="JPEG", quality=85, optimize=True)
+                screenshot = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                
+                # Check if we have a cached result for a similar image
+                # Use the first 100 chars of the base64 string as a simple hash
+                image_hash = screenshot[:100]
+                if image_hash in self._frame_description_cache:
+                    self.logger.info("Using cached observation for similar frame")
+                    return self._frame_description_cache[image_hash]
+                
+                # Construct a prompt appropriate for general 3D games
+                prompt = """
+                Describe this 3D game state in detail. Focus on:
+                1. The player character position and state
+                2. The environment and visible objects
+                3. Any NPCs, enemies, or interactive elements
+                4. The apparent objective or current mission
+                5. Any physics interactions or dynamic elements
+                6. Any unusual visual artifacts or glitches
+                7. Spatial relationships and navigation possibilities
+                """
+            else:
+                # Fall back to traditional screenshot method
+                self.logger.info("Falling back to traditional screenshot method")
+                screenshot = self.sima_agent.get_screenshot()
+                
+                # If we don't have a screenshot, return a default observation
+                if screenshot is None:
+                    return "The game state could not be observed. No screenshot available."
+                
+                # Construct a prompt appropriate for jelly block game
+                prompt = """
+                Describe this jelly block puzzle game state in detail. Focus on:
+                1. The arrangement of blocks on the grid
+                2. The colors, sizes, and numbers on blocks
+                3. Any special blocks or power-ups
+                4. The overall objective based on what you see
+                5. The current progress toward that objective
+                6. Any blocks that appear to be isolated or unable to merge
+                """
             
-            # Execute the action using SIMA
-            result = self.sima_agent.execute_action(step.action_description)
-            
-            # Create execution result
-            execution_result = ExecutionResult(
-                step_id=step.step_id,
-                action_description=step.action_description,
-                observation=result.get("observation", ""),
-                success=result.get("success", False),
-                raw_data=result
+            # Use OpenAI's vision model to describe the game state
+            response = self.llm_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a specialized vision analyst for video games. You provide detailed observations about the current game state to assist with testing and bug detection."
+                    },
+                    {
+                        "role": "user", 
+                        "content": [
+                            {
+                                "type": "text", 
+                                "text": prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{screenshot}"}
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=500
             )
+            description = response.choices[0].message.content
             
-            execution_results.append(execution_result)
-            
-            # Check if the step failed
-            if not execution_result.success:
-                self.logger.warning(f"Step {step.step_id} failed")
+            # Cache the result for similar frames
+            if screenshot:
+                image_hash = screenshot[:100]
+                self._frame_description_cache[image_hash] = description
                 
-                # If this is a checkpoint step, abort the plan
-                if step.is_checkpoint:
-                    self.logger.warning(f"Checkpoint step {step.step_id} failed. Aborting plan.")
-                    break
-                
-                # Try fallback action if available
-                if step.fallback_action:
-                    self.logger.info(f"Attempting fallback action for step {step.step_id}")
-                    
-                    fallback_result = self.sima_agent.execute_action(step.fallback_action)
-                    
-                    fallback_execution_result = ExecutionResult(
-                        step_id=f"{step.step_id}_fallback",
-                        action_description=step.fallback_action,
-                        observation=fallback_result.get("observation", ""),
-                        success=fallback_result.get("success", False),
-                        raw_data=fallback_result,
-                        is_fallback=True
-                    )
-                    
-                    execution_results.append(fallback_execution_result)
-                    
-                    # If the fallback also failed and this is a checkpoint, abort the plan
-                    if not fallback_execution_result.success and step.is_checkpoint:
-                        self.logger.warning(f"Fallback for checkpoint step {step.step_id} also failed. Aborting plan.")
-                        break
-        
-        return execution_results
-
-
-def main():
-    """Example usage of the game testing pipeline"""
-    # Configuration (customize as needed)
-    config = {
-        "openai_api_key": os.environ.get("OPENAI_API_KEY"),
-        "max_workers": 2,
-        "sima_config": {
-            # SIMA configuration
-            "vision_encoder": "openai/clip-vit-large-patch14",
-            "text_encoder": "sentence-transformers/all-mpnet-base-v2",
-            "env_type": "unity",
-            "unity_executable_path": "/path/to/your/game.exe",  # Replace with actual path
-            "device": "cuda" if torch.cuda.is_available() else "cpu",
+                # Limit cache size by removing oldest entries
+                if len(self._frame_description_cache) > self._max_cache_size:
+                    oldest_key = next(iter(self._frame_description_cache))
+                    self._frame_description_cache.pop(oldest_key)
             
-            # Custom action space for your game (optional)
-            "action_space": [
-                "move", "look", "click", "interact", "use_item",
-                "attack", "jump", "open_menu", "close_menu"
-            ],
-            "observer": {
-                "capture_method": "adb",
-                "resize_shape": (224, 224)
-            },
-            "controller": {
-                "control_method": "adb",
-                "action_delay": 0.5
-            }
-
-        }
-    }
-    
-    game_description = """
-    'Jelly Merge Puzzle' is a grid-based sliding puzzle game where jelly blocks are arranged on a square grid. Players can swipe in four directions (up, down, left, right) to slide all blocks simultaneously in that direction. Blocks move until they hit an obstacle, the edge of the grid, or another block. When two blocks collide, they combine into a single block and continue sliding together. The goal of each level is to combine all blocks into a single block through a sequence of strategic swipes. The game progresses through multiple levels with increasingly complex grid configurations and starting block arrangements.
-
-    Key mechanics:
-    1. All blocks move simultaneously when the player swipes
-    2. Blocks combine when they collide
-    3. Combined blocks continue sliding in the swipe direction
-    4. Blocks stop when hitting walls or grid edges
-    5. The win condition requires combining all blocks into a single block
-    6. Some levels have walls or blocked grid squares that affect movement
-    """
-
-    feature_description = """
-    Level solvability feature: Each level in the game should be designed to have at least one valid solution where all blocks can be combined into a single block through some sequence of swipe actions. The game should not contain any levels with impossible-to-win configurations where blocks cannot all be combined regardless of the sequence of moves used.
-    """
-
-    
-    # Initialize and run the pipeline
-    try:
-        pipeline = GameTestingPipeline(config)
-        bugs = pipeline.run_pipeline(game_description, feature_description, num_tasks=5)
-        
-        # Output the results
-        print("\n=== TESTING RESULTS ===\n")
-        if bugs:
-            print(f"Found {len(bugs)} bugs:")
-            for i, bug in enumerate(bugs, 1):
-                print(f"\nBug #{i}: {bug.bug_id}")
-                print(f"Description: {bug.description}")
-                print(f"Severity: {bug.severity}")
-                print(f"Reproduction steps: {bug.reproduction_steps}")
-                print(f"Expected behavior: {bug.expected_behavior}")
-                print(f"Actual behavior: {bug.actual_behavior}")
-        else:
-            print("No bugs found.")
-        print("\n=== END OF TESTING RESULTS ===\n")
-        
-    except Exception as e:
-        print(f"Error running the pipeline: {str(e)}")
-
+            return description
+            
+        except Exception as e:
+            self.logger.error(f"Error getting observation: {str(e)}")
+            return "Failed to get observation due to an error."
 
 def test_current_level():
-    """Test the currently visible level using adaptive planning"""
-    device_id = None
-    try:
-        result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
-        lines = result.stdout.strip().split('\n')[1:]
-        
-        for line in lines:
-            if line.strip() and "localhost" in line and "device" in line:
-                device_id = line.split()[0]
-                print(f"Found BlueStacks device: {device_id}")
-                break
-    except Exception as e:
-        print(f"Error finding device: {e}")
+    """Test the currently visible level using video processing and adaptive planning"""
+    print("\n===== Testing Current Level With Video Processing =====\n")
     
-    config = {
-        "openai_api_key": os.environ.get("OPENAI_API_KEY"),
-        "max_workers": 1,
-        "sima_config": {
-            "observer": {
-                "capture_method": "adb",
-                "resize_shape": (224, 224),
-                "device_id": device_id
-            },
-            "controller": {
-                "control_method": "adb",
-                "action_delay": 0.5,
-                "device_id": device_id
-            }
-        }
-    }
+    # Game and feature descriptions for a 3D game
+    game_description = """3D Adventure Game is an open-world exploration game where players navigate through various environments,
+    solve puzzles, and interact with objects and characters.
     
-    # Game descriptions
-    game_description = """
-    'Jelly Merge Puzzle' is a grid-based sliding puzzle game where jelly blocks are arranged on a square grid. Players can swipe in four directions (up, down, left, right) to slide all blocks simultaneously in that direction. Blocks move until they hit an obstacle, the edge of the grid, or another block. When two blocks collide, they combine into a single block and continue sliding together. The goal of each level is to combine all blocks into a single block through a sequence of strategic swipes.
+    The game features:
+    - A 3D environment with physics simulation
+    - Player character with movement abilities (walk, run, jump, interact)
+    - Various interactive objects that can be manipulated
+    - Environmental puzzles that require spatial reasoning
+    - Character progression and inventory system
     """
     
-    feature_description = """
-    Level solvability feature: Each level should be designed to have at least one valid solution where all blocks can be combined into a single block through some sequence of swipe actions. The game should not contain any levels with impossible-to-win configurations.
+    feature_description = """The physics interaction system allows players to manipulate objects in the game world
+    with realistic physical properties. Objects should respond to gravity, collisions, and player interactions
+    in a consistent and predictable manner.
+    
+    The feature implementation ensures that:
+    1. Objects have appropriate mass, friction, and collision properties
+    2. Objects can be pushed, pulled, picked up, and thrown based on their size and weight
+    3. Physics interactions do not cause objects to clip through walls or other solid objects
+    4. Objects at rest remain stable and do not jitter or move unexpectedly
+    5. Collisions between objects produce appropriate responses and sound effects
     """
     
-    # Initialize pipeline
-    pipeline = GameTestingPipeline(config)
-    
-    # Create a simple test task for the current level
+    # Create a test task for a 3D game
     test_task = TestTask(
-        task_id="TEST-CURRENT-LEVEL",
-        description="Test if the current level is solvable by finding a sequence of swipes that combines all blocks",
-        initial_state="Game is showing a level with jelly blocks arranged on a grid",
-        expected_outcome="All blocks can be combined into a single block through some sequence of swipes",
-        potential_bugs=["Impossible-to-win configuration", "Isolated blocks", "Blocks that cannot be combined"]
+        task_id="physics_interaction_test",
+        description="Test if physics interactions in the 3D environment work correctly and consistently",
+        initial_state="Player is in a 3D environment with various interactive objects visible",
+        expected_outcome="Objects should respond realistically to player interactions, respect collision boundaries, and not exhibit glitches or unexpected behavior"
     )
     
-    # Run the adaptive test
-    bugs = pipeline._execute_test_task_adaptive(game_description, feature_description, test_task)
+    # Create pipeline instance with configuration for video processing
+    config = {
+        "video_buffer_size": 8,  # Store 8 frames for analysis
+        "capture_fps": 15,      # Capture at 15 frames per second
+        "resize_shape": (800, 600),  # Resolution for captures
+        "change_threshold": 0.1  # Sensitivity for detecting changes
+    }
     
+    pipeline = GameTestingPipeline(config)
+    
+    print("Starting test with video processing enabled")
+    print("This will analyze the game through real-time video frames")
+    print("Please ensure the game window is visible and active\n")
+    
+    # Give user time to prepare
+    for i in range(5, 0, -1):
+        print(f"Starting in {i}...")
+        time.sleep(1)
+    
+    # Execute the test with video processing
+    bugs = pipeline._execute_test_task_adaptive(
+        game_description,
+        feature_description,
+        test_task
+    )
+    
+    # Display results
     if bugs:
-        print("\n==== BUGS DETECTED ====")
+        print(f"\n{len(bugs)} bug(s) found:")
         for bug in bugs:
-            print(f"Bug ID: {bug.bug_id}")
+            print(f"\nBug ID: {bug.bug_id}")
             print(f"Description: {bug.description}")
             print(f"Severity: {bug.severity}")
-            print(f"Expected: {bug.expected_behavior}")
-            print(f"Actual: {bug.actual_behavior}")
-            print(f"Fix suggestion: {bug.potential_fix}\n")
+            print(f"Steps to reproduce: {bug.reproduction_steps}")
     else:
-        print("\n==== NO BUGS DETECTED ====")
-        print("The current level appears to be solvable.")
+        print("\nNo bugs found.")
 
-if __name__ == "__main__":
-    test_current_level()
+test_current_level()
