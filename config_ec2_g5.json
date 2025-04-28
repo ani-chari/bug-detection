@@ -1,0 +1,24 @@
+{
+    "openai_api_key": "",
+    "video_buffer_size": 10,
+    "frame_interval": 1,
+    "change_threshold": 0.1,
+    "capture_fps": 30,
+    "resize_shape": [1280, 720],
+    "use_gpu": true,
+    "gpu_device": 0,
+    "use_unity_api": true,
+    "unity": {
+        "executable_path": "",
+        "window_title": "Unity Game",
+        "api_host": "localhost",
+        "api_port": 8080
+    },
+    "sima": {
+        "model_precision": "float16",
+        "batch_size": 8,
+        "num_workers": 4
+    },
+    "max_workers": 6,
+    "continuous_mode": true
+}

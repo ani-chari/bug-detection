@@ -123,6 +123,11 @@ class SIMAAgent(SIMACore):
         self.config = config or {}
         self.logger = logging.getLogger(__name__ + ".SIMAAgent")
         
+        # For continuous control tracking
+        self.current_action = None
+        self.current_action_start_time = 0
+        self.continuous_mode = config.get("continuous_mode", True)
+        
         # Initialize OpenAI client for enhanced descriptions
         openai_api_key = self.config.get("openai_api_key", os.environ.get("OPENAI_API_KEY"))
         self.llm_client = OpenAI(api_key=openai_api_key)
@@ -168,11 +173,22 @@ class SIMAAgent(SIMACore):
         """Execute a natural language action"""
         self.logger.info(f"Executing action: {action_description}")
         
+        # Parse action for structured control
+        parsed_action = self._parse_action(action_description)
+        
+        # Check if we need to stop previous action in non-continuous mode
+        if not self.continuous_mode and self.current_action is not None:
+            self._stop_current_action()
+        
+        # Update current action tracking
+        self.current_action = parsed_action
+        self.current_action_start_time = time.time()
+        
         if self.sima is None:
-            return self._simulated_execution(action_description)
+            return self._simulated_execution(action_description, parsed_action)
         
         try:
-            # Execute the action using SIMA
+            # Execute the action using SIMA with the parsed action information
             result = self.sima.execute_action(action_description)
             
             # Enhance the observation description using an LLM
@@ -182,8 +198,9 @@ class SIMAAgent(SIMACore):
                 result.get("success", False)
             )
             
-            # Update the result with the enhanced observation
+            # Update the result with the enhanced observation and parsed action data
             result["observation"] = enhanced_observation
+            result["parsed_action"] = parsed_action
             
             return result
             
@@ -191,6 +208,117 @@ class SIMAAgent(SIMACore):
             self.logger.error(f"SIMA execution error: {str(e)}")
             self.logger.info("Falling back to simulated execution")
             return self._simulated_execution(action_description)
+    
+    def execute_control(self, control: Dict[str, Any], action_text: str = "") -> Dict[str, Any]:
+        """Execute a control directive directly without parsing.
+        
+        Args:
+            control: The control directive to execute directly
+            action_text: Text description for logging purposes
+            
+        Returns:
+            Execution result dictionary
+        """
+        self.logger.info(f"Executing direct control: {control}")
+        
+        # If control is empty or invalid, fall back to text parsing
+        if not control or not isinstance(control, dict) or "type" not in control:
+            self.logger.warning("Invalid control directive, falling back to text parsing")
+            return self.execute_action(action_text or "swipe right")
+        
+        # Check if this is a new action that's different from the current one
+        is_new_action = True
+        if self.current_action is not None:
+            # Compare relevant fields to determine if this is actually a new action
+            if (control.get("type") == self.current_action.get("type") and
+                control.get("direction") == self.current_action.get("direction")):
+                # Same action type and direction, so not a new action
+                is_new_action = False
+        
+        # Prepare a valid swipe action structure if needed
+        action = control.copy()
+        
+        # Ensure we have valid coordinates for the swipe
+        if action["type"] == "swipe" and "coordinates" in action:
+            # Extract coordinates from the control structure
+            if "start" not in action and "end" not in action:
+                action["start"] = action["coordinates"].get("start", {"x": 0.5, "y": 0.5})
+                action["end"] = action["coordinates"].get("end", {"x": 0.7, "y": 0.5})
+                # Remove the coordinates field as it's not part of the standard format
+                action.pop("coordinates", None)
+        
+        # For Push'em All, we need to maintain continuous touch and just change positions
+        # Check if we have any existing touch action
+        if self.current_action is None:
+            # No current action, so start with a new touch
+            self.logger.info("Starting new touch action")
+            touch_action = {
+                "type": "touch_down",
+                "x": action.get("start", {}).get("x", 0.5),
+                "y": action.get("start", {}).get("y", 0.5),
+            }
+            # First touch down to begin dragging
+            if self.sima is not None:
+                try:
+                    self.sima.execute_action(touch_action)
+                    time.sleep(0.01)  # Short delay to ensure touch is registered
+                except Exception as e:
+                    self.logger.warning(f"Failed to start touch: {e}")
+                    
+        # Now execute the drag to the new position (whether continuing or starting new)
+        drag_action = {
+            "type": "touch_move",
+            "x": action.get("end", {}).get("x", 0.7),
+            "y": action.get("end", {}).get("y", 0.5),
+        }
+        
+        # Only update the current action if it's actually new
+        if is_new_action:
+            self.logger.info(f"Setting new current action: {action}")
+            self.current_action = action
+            self.current_action_start_time = time.time()
+        else:
+            self.logger.info("Continuing with same touch action but moving to new position")
+        
+        # Execute using SIMA or fallback to simulation
+        if self.sima is None:
+            return self._simulated_execution(action_text or f"Direct control: {action['type']} {action.get('direction', '')}", action)
+        
+        try:
+            # Execute the drag action using SIMA
+            self.logger.info(f"Executing drag to: {drag_action['x']}, {drag_action['y']}")
+            result = self.sima.execute_action(drag_action)
+            
+            # Provide a descriptive observation
+            direction = action.get("direction", "")
+            if direction == "left":
+                observation = "Character moved left while continuing forward movement"
+            elif direction == "right":
+                observation = "Character moved right while continuing forward movement"
+            elif direction == "up":
+                observation = "Character extended pushing rod forward"
+            else:
+                observation = f"Character moved in direction: {direction}"
+            
+            # Update the result
+            result["observation"] = observation
+            result["action"] = action
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"SIMA execution error for touch move: {str(e)}")
+            self.logger.info("Falling back to simulated execution")
+            return self._simulated_execution(action_text or f"Direct control: {action}", action)
+    
+    def _prepare_sima_action(self, control: Dict[str, Any], action_text: str) -> Any:
+        """Prepare a control directive for SIMA execution.
+        
+        This method converts our control format to whatever SIMA expects.
+        """
+        # For now, just return the control as is, or convert to a format SIMA understands
+        # This may need customization based on SIMA's API
+        return control
     
     def _enhance_observation_description(
         self,
@@ -211,9 +339,9 @@ class SIMAAgent(SIMACore):
             """
             
             response = self.llm_client.chat.completions.create(
-                model="o3-mini",
+                model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=150
+                max_tokens=150
             )
             
             return response.choices[0].message.content.strip()
@@ -221,39 +349,198 @@ class SIMAAgent(SIMACore):
             self.logger.error(f"Failed to enhance observation description: {e}")
             return base_observation
     
-    def _simulated_execution(self, action_description: str) -> Dict[str, Any]:
-        """Simulated action execution (fallback)"""
+    def _parse_action(self, action_description: str) -> Dict[str, Any]:
+        """Parse natural language action into structured control data for Push'em All"""
+        action_lower = action_description.lower()
+        
+        # Default structured action (fallback)
+        parsed_action = {
+            "type": "swipe",  # Default to swipe for Push'em All
+            "direction": "right",  # Default direction if none specified
+            "params": {}
+        }
+        
+        # For Push'em All, prioritize lateral movement and forward rod extension
+        if "swipe" in action_lower or "move" in action_lower or "push" in action_lower:
+            parsed_action["type"] = "swipe"
+            
+            # Extract appropriate direction for Push'em All (prioritize left/right/up)
+            if "left" in action_lower:
+                parsed_action["direction"] = "left"
+                parsed_action["params"] = {
+                    "start": {"x": 0.7, "y": 0.5},
+                    "end": {"x": 0.3, "y": 0.5}
+                }
+            elif "right" in action_lower:
+                parsed_action["direction"] = "right"
+                parsed_action["params"] = {
+                    "start": {"x": 0.3, "y": 0.5},
+                    "end": {"x": 0.7, "y": 0.5}
+                }
+            elif "up" in action_lower or "forward" in action_lower:
+                parsed_action["direction"] = "up"
+                parsed_action["params"] = {
+                    "start": {"x": 0.5, "y": 0.7},
+                    "end": {"x": 0.5, "y": 0.3}
+                }
+            
+            # Look for more precise swipe parameters if available
+            if "start" in action_lower and "end" in action_lower:
+                try:
+                    # Look for JSON-like structure with regex
+                    import re
+                    start_match = re.search(r'start.*?{.*?"x"\s*:\s*([0-9.]+).*?"y"\s*:\s*([0-9.]+)', action_lower)
+                    end_match = re.search(r'end.*?{.*?"x"\s*:\s*([0-9.]+).*?"y"\s*:\s*([0-9.]+)', action_lower)
+                    
+                    if start_match and end_match:
+                        parsed_action["params"] = {
+                            "start": {"x": float(start_match.group(1)), "y": float(start_match.group(2))},
+                            "end": {"x": float(end_match.group(1)), "y": float(end_match.group(2))}
+                        }
+                except Exception as e:
+                    self.logger.warning(f"Failed to parse swipe coordinates: {e}")
+        
+        # Handle push-specific terminology
+        if "push" in action_lower:
+            # Always translates to a swipe action in Push'em All
+            parsed_action["type"] = "swipe"
+            
+            # If direction not already set, check for push direction
+            if not parsed_action["direction"] or parsed_action["direction"] == "unknown":
+                if "left" in action_lower:
+                    parsed_action["direction"] = "left"
+                    parsed_action["params"] = {"start": {"x": 0.7, "y": 0.5}, "end": {"x": 0.3, "y": 0.5}}
+                elif "right" in action_lower:
+                    parsed_action["direction"] = "right"
+                    parsed_action["params"] = {"start": {"x": 0.3, "y": 0.5}, "end": {"x": 0.7, "y": 0.5}}
+                else:  # Default to forward push if no direction
+                    parsed_action["direction"] = "up"
+                    parsed_action["params"] = {"start": {"x": 0.5, "y": 0.7}, "end": {"x": 0.5, "y": 0.3}}
+        
+        # Reject any backward or down movements - not appropriate for Push'em All
+        if parsed_action["direction"] == "down" or "backward" in action_lower or "back" in action_lower:
+            self.logger.warning("Rejecting backward/down movement - not appropriate for Push'em All")
+            # Replace with a safe lateral movement
+            parsed_action["direction"] = "right"
+            parsed_action["params"] = {"start": {"x": 0.3, "y": 0.5}, "end": {"x": 0.7, "y": 0.5}}
+        
+        self.logger.info(f"Parsed action: {action_description} -> {parsed_action}")
+        return parsed_action
+    
+    def _stop_current_action(self, force_release=False):
+        """Stop the current action if one is in progress.
+        
+        For Push'em All, we typically don't want to release touch between actions,
+        but there are cases where we might need to completely reset (e.g., when exiting the game).
+        
+        Args:
+            force_release: If True, will release the touch even for Push'em All controls
+        """
+        if self.current_action is None:
+            return
+            
+        self.logger.info(f"Handling action transition: {self.current_action}")
+        
+        # For Push'em All, we usually DON'T want to release touch between actions
+        # unless explicitly told to do so
+        if force_release:
+            if self.sima is not None:
+                try:
+                    # Create a touch release action
+                    release_action = {
+                        "type": "touch_release",
+                        "x": 0.5,  # Center of screen
+                        "y": 0.5   # Center of screen
+                    }
+                    self.logger.info("Sending explicit touch release to completely stop interaction")
+                    self.sima.execute_action(release_action)
+                    
+                    # Add a small delay to ensure the release is processed
+                    time.sleep(0.01)
+                except Exception as e:
+                    self.logger.warning(f"Failed to release touch: {e}")
+        else:
+            # For normal action transitions in Push'em All, we just update the tracking
+            # without releasing the touch, since we want to keep dragging
+            self.logger.info("Transitioning to new action without releasing touch")
+        
+        # Reset current action tracking regardless
+        self.current_action = None
+        
+    def _simulated_execution(self, action_description: str, parsed_action: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Simulated action execution for Push'em All mobile game"""
         self.logger.info(f"Using simulated execution for: {action_description}")
         
         # Determine if action should succeed
         success = True
         
-        # Check for negative indicators
+        # Always use the parsed action if available
+        if parsed_action and isinstance(parsed_action, dict):
+            # Extract direction from the parsed action
+            action_type = parsed_action.get("type", "")
+            direction = parsed_action.get("direction", "")
+            
+            # Create observation based on the control directive
+            if action_type == "swipe":                
+                if direction == "left":
+                    observation = "Character moved left while continuing forward. Any enemies to the left may have been pushed."
+                elif direction == "right":
+                    observation = "Character moved right while continuing forward. Any enemies to the right may have been pushed."
+                elif direction == "up":
+                    observation = "Rod extended forward from the character. Any enemies ahead may have been pushed."
+                else:
+                    observation = f"Character performed a {direction} swipe motion."
+                    
+                return {
+                    "success": success,
+                    "observation": observation,
+                    "action": parsed_action,
+                    "raw_data": {
+                        "execution_details": {
+                            "actions": [{"type": "direct_control", "success": success}]
+                        }
+                    }
+                }
+        
+        # Check for negative indicators in text description
         negative_indicators = ["impossible", "fail", "can't", "cannot", "unable"]
         if any(indicator in action_description.lower() for indicator in negative_indicators):
             success = False
         
-        # Generate appropriate observation based on action type
+        # Generate appropriate observation based on Push'em All specific actions from text
         action_lower = action_description.lower()
         
-        if "move" in action_lower or "walk" in action_lower or "go" in action_lower:
-            observation = "Character moved to the specified location. Surrounding environment updated accordingly."
-        elif "attack" in action_lower or "hit" in action_lower or "fight" in action_lower:
-            observation = "Attack animation played. Target reacted with appropriate feedback and health reduction."
-        elif "pick" in action_lower or "grab" in action_lower or "take" in action_lower:
-            observation = "Item was collected and added to inventory. Visual and sound feedback confirmed acquisition."
-        elif "open" in action_lower:
-            observation = "Container/door opened with appropriate animation. Interior/next area now visible."
-        elif "use" in action_lower:
-            observation = "Item used with expected effect. Animation and particle effects displayed correctly."
-        elif "jump" in action_lower:
-            observation = "Character performed jumping animation and cleared the obstacle."
-        elif "talk" in action_lower or "speak" in action_lower:
-            observation = "Dialogue interface appeared with NPC response options."
-        elif "teleport" in action_lower or "portal" in action_lower:
-            observation = "Character teleported to the target location with appropriate visual effects."
+        if "swipe" in action_lower:
+            direction = ""
+            for dir in ["left", "right", "up", "down"]:
+                if dir in action_lower:
+                    direction = dir
+                    break
+            if direction:
+                observation = f"Pushing rod extended {direction} with appropriate animation. Rod retracts when touch is released."
+            else:
+                observation = "Pushing rod extended in the direction of the swipe gesture. Rod retracts when touch is released."
+        elif "push" in action_lower or "knock" in action_lower:
+            if "enemy" in action_lower or "enemies" in action_lower:
+                observation = "Pushing rod extended and made contact with enemy. Enemy reacted to the push with physics-based movement."
+                if "edge" in action_lower or "off" in action_lower or "platform" in action_lower:
+                    observation += " Enemy was pushed toward the platform edge."
+            else:
+                observation = "Pushing rod extended and pushed in the specified direction. Any objects in the path reacted to the push."
+        elif "tap" in action_lower or "touch" in action_lower or "click" in action_lower:
+            observation = "Touch registered on the screen. Character or game interface responded to the touch input."
+        elif "drag" in action_lower:
+            observation = "Dragging motion registered. Character moved laterally across the platform while continuing forward movement."
+        elif "collect" in action_lower or "power" in action_lower:
+            observation = "Character moved toward the power-up and collected it. Visual effects indicated successful collection."
+        elif "move" in action_lower or "walk" in action_lower or "go" in action_lower:
+            observation = "Character is automatically moving forward along the path. Any lateral movement was controlled by touch input."
+        elif "dodge" in action_lower or "avoid" in action_lower:
+            observation = "Character moved laterally to avoid the obstacle or enemy while continuing forward movement."
+        elif "navigate" in action_lower or "platform" in action_lower:
+            observation = "Character navigated along the elevated platform. Close proximity to edges was visible through the camera angle."
         else:
-            observation = f"Action '{action_description}' executed successfully with appropriate visual feedback."
+            observation = f"Action '{action_description}' executed in Push'em All with appropriate visual feedback."
         
         if not success:
             observation = f"Failed to execute '{action_description}'. No significant change observed in the environment."
@@ -360,17 +647,21 @@ class AdaptivePlanner:
     """
     Planner that generates actions adaptively based on observed game state
     """
-    def __init__(self, llm_client: OpenAI):
+    def __init__(self, llm_client: OpenAI, config: Dict[str, Any] = None):
         self.llm_client = llm_client
         self.logger = logging.getLogger(__name__ + ".AdaptivePlanner")
         self.action_history = []
-        self.exploration_phase = True
-        self.exploration_budget = 5  # Number of initial exploration moves
+        
+        # Configuration
+        self.config = config or {}
+        self.use_exploration_phase = self.config.get("use_exploration_phase", False)  # Default to direct play
+        self.exploration_phase = self.use_exploration_phase
+        self.exploration_budget = self.config.get("exploration_budget", 3)  # Number of initial exploration moves
         
     def reset(self):
         """Reset the planner state for a new test"""
         self.action_history = []
-        self.exploration_phase = True
+        self.exploration_phase = self.use_exploration_phase  # Only use exploration if configured
         
     def plan_next_action(
         self, 
@@ -411,7 +702,7 @@ class AdaptivePlanner:
         # Generate next action using LLM
         try:
             response = self.llm_client.chat.completions.create(
-                model="o3-mini",
+                model="gpt-4o",
                 messages=[
                     {"role": "system", "content": "You are an adaptive game testing AI that plans one action at a time"},
                     {"role": "user", "content": prompt}
@@ -421,22 +712,23 @@ class AdaptivePlanner:
             
             result = json.loads(response.choices[0].message.content)
             
-            # Create an ActionStep object
-            step_id = f"{'EXPLORE' if self.exploration_phase else 'TEST'}-{len(self.action_history) + 1:03d}"
+            # Create an ActionStep object with a simpler ID format using the direct control format
+            step_id = f"ACTION-{len(self.action_history) + 1:03d}"
             action_step = ActionStep(
                 step_id=step_id,
-                action_description=result.get("action_description", ""),
-                expected_observation=result.get("expected_observation", ""),
-                success_criteria=result.get("success_criteria", ""),
-                fallback_action=result.get("fallback_action"),
-                is_checkpoint=result.get("is_checkpoint", False)
+                action_description=result.get("description", ""),  # Use the short description directly
+                expected_observation="Control will be applied",     # Simplified expectations
+                success_criteria="Control is applied correctly",    # Simplified criteria
+                fallback_action=None,                              # No fallback needed with direct controls
+                is_checkpoint=False                               # No checkpoints with direct controls
             )
             
-            # Store the action in history with its JSON representation
+            # Store the control directive directly in history for execution
             self.action_history.append({
                 "step": action_step,
-                "action": result.get("action", {}),
-                "phase": "exploration" if self.exploration_phase else "exploitation"
+                "control": result.get("control", {}),           # Store the direct control command
+                "reasoning": result.get("reasoning", ""),      # Store the reasoning
+                "phase": "direct_play"                         # Always use direct_play mode
             })
             
             self.logger.info(f"Generated next action: {action_step.action_description}")
@@ -450,24 +742,37 @@ class AdaptivePlanner:
     
     def _generate_fallback_action(self) -> ActionStep:
         """Generate a fallback action if LLM generation fails"""
-        step_id = f"{'EXPLORE' if self.exploration_phase else 'TEST'}-{len(self.action_history) + 1:03d}"
+        step_id = f"ACTION-{len(self.action_history) + 1:03d}"
         
-        # Try different directions in sequence
+        # Prioritize appropriate directions for Push'em All - lateral movement and forward rod extension
+        # Note: In Push'em All, character moves forward automatically, so we focus on left/right movement 
+        # and forward rod extension (up swipe)
         directions = [
-            {"type": "swipe", "start": {"x": 0.3, "y": 0.5}, "end": {"x": 0.7, "y": 0.5}},  # Right
-            {"type": "swipe", "start": {"x": 0.7, "y": 0.5}, "end": {"x": 0.3, "y": 0.5}},  # Left
-            {"type": "swipe", "start": {"x": 0.5, "y": 0.7}, "end": {"x": 0.5, "y": 0.3}},  # Up
-            {"type": "swipe", "start": {"x": 0.5, "y": 0.3}, "end": {"x": 0.5, "y": 0.7}}   # Down
+            {"type": "swipe", "direction": "right", "start": {"x": 0.3, "y": 0.5}, "end": {"x": 0.7, "y": 0.5}},  # Move/push right
+            {"type": "swipe", "direction": "left", "start": {"x": 0.7, "y": 0.5}, "end": {"x": 0.3, "y": 0.5}},  # Move/push left
+            {"type": "swipe", "direction": "up", "start": {"x": 0.5, "y": 0.7}, "end": {"x": 0.5, "y": 0.3}}   # Forward rod extension
+            # No backward option - character moves forward automatically
         ]
         
         direction_idx = len(self.action_history) % len(directions)
-        direction_name = ["right", "left", "up", "down"][direction_idx]
+        direction_name = ["right", "left", "up"][direction_idx]
         
+        # Create action description based on the direction
+        if direction_name == "right":
+            action_description = "Swipe right to move character rightward and push enemies"
+            expected = "Character moves right and may push enemies off the edge"
+        elif direction_name == "left":
+            action_description = "Swipe left to move character leftward and push enemies"
+            expected = "Character moves left and may push enemies off the edge"
+        else:  # up
+            action_description = "Swipe up to extend pushing rod forward"
+            expected = "Rod extends forward to push enemies ahead"
+            
         fallback_action = ActionStep(
             step_id=step_id,
-            action_description=f"Swipe {direction_name}",
-            expected_observation="Blocks may move if not obstructed",
-            success_criteria="Action executed successfully",
+            action_description=action_description,
+            expected_observation=expected,
+            success_criteria="Character moves or rod extends as intended",
             fallback_action=None,
             is_checkpoint=False
         )
@@ -515,7 +820,7 @@ class AdaptivePlanner:
         """Generate a prompt for the exploration phase"""
         
         return f"""
-        You are an expert game tester exploring a puzzle game to understand its mechanics.
+        You are an expert game tester trying to find bugs in the Push'em All mobile game.
         
         Game Context:
         {game_description}
@@ -532,28 +837,38 @@ class AdaptivePlanner:
         Action History:
         {action_history_summary}
         
-        You are in the EXPLORATION PHASE. Your goal is to understand the game mechanics by trying different actions.
-        Plan a SINGLE next action that helps you learn about how the game works.
+        You are in the EXPLORATION PHASE. Your goal is to understand how the game mechanics work
+        by trying different swipe gestures to observe how the pushing rod behaves and interacts with enemies.
         
-        Provide your response as a JSON object with these fields:
-        - action: A JSON object specifying exactly what to do using this format:
-          {{
-            "type": "swipe",
-            "start": {{"x": 0.7, "y": 0.5}},  // Starting point (normalized coordinates 0-1)
-            "end": {{"x": 0.3, "y": 0.5}},    // Ending point (normalized coordinates 0-1)
-            "duration": 0.3
-          }}
-        - action_description: A clear description of what this action does and why you chose it
-        - expected_observation: What you expect to happen when this action is performed
-        - success_criteria: How to determine if this action revealed useful information
-        - fallback_action: An alternative action if this one fails
-        - is_checkpoint: false (exploration actions are never checkpoints)
+        Plan a SINGLE next action that:
+        1. Explores different swipe directions to extend the pushing rod in various ways
+        2. Tests how the physics of pushing enemies works at different angles
+        3. Investigates how enemies react when pushed toward platform edges
+        4. Explores how the player character navigates the platforms
+        5. Tests any power-ups or special features that may be present
         
-        IMPORTANT: Use these coordinates for different swipe directions:
-        - Left swipe: start {{"x": 0.7, "y": 0.5}}, end {{"x": 0.3, "y": 0.5}}
-        - Right swipe: start {{"x": 0.3, "y": 0.5}}, end {{"x": 0.7, "y": 0.5}}
-        - Up swipe: start {{"x": 0.5, "y": 0.7}}, end {{"x": 0.5, "y": 0.3}}
-        - Down swipe: start {{"x": 0.5, "y": 0.3}}, end {{"x": 0.5, "y": 0.7}}
+        Provide your response as a JSON object with the following structure:
+        {{
+          "control": {{  // Direct control command that will be applied without parsing
+            "type": "swipe",  // Must be 'swipe' for Push'em All
+            "direction": "left",  // Must be one of: 'left', 'right', 'up'
+            "coordinates": {{  // Exact coordinate values to use
+              "start": {{"x": 0.7, "y": 0.5}},  // Left swipe starts at right side
+              "end": {{"x": 0.3, "y": 0.5}}     // Left swipe ends at left side
+            }}
+          }},
+          "reasoning": "Brief explanation of why you chose this control",
+          "description": "Swipe left to push enemy off the platform edge"  // Very brief action description
+        }}
+        
+        Your response should ONLY have these three fields and be valid JSON.
+        
+        IMPORTANT: ONLY USE THESE swipe directions for Push'em All:
+        - Left swipe: start {{"x": 0.7, "y": 0.5}}, end {{"x": 0.3, "y": 0.5}} - Move/push left
+        - Right swipe: start {{"x": 0.3, "y": 0.5}}, end {{"x": 0.7, "y": 0.5}} - Move/push right
+        - Up swipe: start {{"x": 0.5, "y": 0.7}}, end {{"x": 0.5, "y": 0.3}} - Extend rod forward to push enemies
+        
+        DO NOT USE downward or backward swipes - not appropriate for this game
         """
     
     def _generate_exploitation_prompt(
@@ -564,53 +879,50 @@ class AdaptivePlanner:
         current_observation: str,
         action_history_summary: str
     ) -> str:
-        """Generate a prompt for the exploitation phase"""
+        """Generate a prompt for direct gameplay (exploitation phase)"""
         
         return f"""
-        You are an expert game tester trying to solve a puzzle game and identify any bugs.
+        You are playing the Push'em All mobile game. Your goal is to push enemies off platforms while navigating toward the finish line.
         
-        Game Context:
-        {game_description}
+        IMPORTANT CONTROLS:
+        - Your character moves FORWARD AUTOMATICALLY - DO NOT try to control forward movement
+        - Swipe LEFT/RIGHT to move your character laterally across the platform
+        - Swipe UP to extend the pushing rod forward to push enemies ahead of you
+        - NEVER swipe DOWN - there is no backward movement in this game
         
-        Feature Being Tested:
-        {feature_description}
-        
-        Test Task:
-        {json.dumps(test_task.to_dict(), indent=2)}
+        Game Strategy:
+        - Push enemies off platform edges using your extending rod
+        - Time your pushes to knock multiple enemies off simultaneously
+        - Avoid falling off edges yourself
         
         Current Game State:
         {current_observation}
         
-        Action History:
-        {action_history_summary}
+        Choose ONE action from: SWIPE LEFT, SWIPE RIGHT, or SWIPE UP (forward rod extension).
+        Focus only on these valid moves.
         
-        You are in the EXPLOITATION PHASE. Based on what you've learned about the game mechanics,
-        your goal is now to strategically test if the level is solvable or has bugs.
+        Provide your response as a JSON object with the following structure:
+        {{
+          "control": {{  // Direct control command that will be applied without parsing
+            "type": "swipe",  // Must be 'swipe' for Push'em All
+            "direction": "left",  // Must be one of: 'left', 'right', 'up'
+            "coordinates": {{  // Exact coordinate values to use
+              "start": {{"x": 0.7, "y": 0.5}},  // Left swipe starts at right side
+              "end": {{"x": 0.3, "y": 0.5}}     // Left swipe ends at left side
+            }}
+          }},
+          "reasoning": "Brief explanation of why you chose this control",
+          "description": "Swipe left to push enemy off the platform edge"  // Very brief action description
+        }}
         
-        Plan a SINGLE next action that:
-        1. Makes progress toward combining blocks into a single one
-        2. Tests if certain block arrangements create unsolvable situations
-        3. Verifies whether all blocks can eventually be combined
+        Your response should ONLY have these three fields and be valid JSON.
         
-        Provide your response as a JSON object with these fields:
-        - action: A JSON object specifying exactly what to do using this format:
-          {{
-            "type": "swipe",
-            "start": {{"x": 0.7, "y": 0.5}},  // Starting point (normalized coordinates 0-1)
-            "end": {{"x": 0.3, "y": 0.5}},    // Ending point (normalized coordinates 0-1)
-            "duration": 0.3
-          }}
-        - action_description: A clear description of what this action does and your strategy
-        - expected_observation: What you expect to happen when this action is performed
-        - success_criteria: How to determine if this action revealed useful information
-        - fallback_action: An alternative action if this one fails
-        - is_checkpoint: Whether this step's failure would indicate a bug (use sparingly)
+        IMPORTANT: ONLY USE THESE swipe directions for Push'em All:
+        - Left swipe: start {{"x": 0.7, "y": 0.5}}, end {{"x": 0.3, "y": 0.5}} - Move/push left
+        - Right swipe: start {{"x": 0.3, "y": 0.5}}, end {{"x": 0.7, "y": 0.5}} - Move/push right
+        - Up swipe: start {{"x": 0.5, "y": 0.7}}, end {{"x": 0.5, "y": 0.3}} - Extend rod forward to push enemies
         
-        IMPORTANT: Use these coordinates for different swipe directions:
-        - Left swipe: start {{"x": 0.7, "y": 0.5}}, end {{"x": 0.3, "y": 0.5}}
-        - Right swipe: start {{"x": 0.3, "y": 0.5}}, end {{"x": 0.7, "y": 0.5}}
-        - Up swipe: start {{"x": 0.5, "y": 0.7}}, end {{"x": 0.5, "y": 0.3}}
-        - Down swipe: start {{"x": 0.5, "y": 0.3}}, end {{"x": 0.5, "y": 0.7}}
+        DO NOT USE downward or backward swipes - not appropriate for this game
         """
     
     def update_action_result(self, step_id: str, result: Dict[str, Any]):
@@ -942,6 +1254,10 @@ class GameTestingPipeline:
         # Thread pool for parallel task execution
         self.max_workers = self.config.get("max_workers", 3)
         
+        # Action tracking to prevent repeated execution of the same action
+        self.last_action_id = None
+        self.last_control = None
+        
         self.logger.info("Game Testing Pipeline initialized with video processing capabilities")
 
     
@@ -1039,8 +1355,12 @@ class GameTestingPipeline:
         """Execute a test task using the adaptive planner with video processing and feedback loop"""
         self.logger.info(f"Executing test task with adaptive planning and video analysis: {test_task.task_id}")
         
-        # Initialize the adaptive planner
-        planner = AdaptivePlanner(self.llm_client)
+        # Initialize the adaptive planner with configuration
+        planner_config = {
+            "use_exploration_phase": self.config.get("use_exploration_phase", False),  # Default to direct play 
+            "exploration_budget": self.config.get("exploration_budget", 3)
+        }
+        planner = AdaptivePlanner(self.llm_client, planner_config)
         
         # Start capturing video frames
         self.logger.info("Starting video frame capture")
@@ -1057,9 +1377,14 @@ class GameTestingPipeline:
         )
         self.logger.info(f"Initial situation analysis: {initial_situation.get('analysis', 'No analysis available')}")
         
+        # Configure for faster iterations with continuous control
         execution_results = []
-        max_steps = 15  # Prevent infinite loops
+        max_steps = 10  # Reduced max steps for faster overall execution
         step_count = 0
+        last_action_type = None
+        
+        # Configure SIMA agent for continuous control mode
+        self.sima_agent.continuous_mode = self.config.get("continuous_mode", True)
         
         # Execute actions until task complete or max steps reached
         while not self._is_task_complete(execution_results, test_task) and step_count < max_steps:
@@ -1109,34 +1434,40 @@ class GameTestingPipeline:
                 self.logger.warning("No action planned, ending task execution")
                 break
                 
-            # Execute the action
-            action_text = action.action_description if isinstance(action, ActionStep) else action
-            self.logger.info(f"Executing action: {action_text}")
-            result = self.sima_agent.execute_action(action_text)
-            
-            # Adaptive wait time based on action complexity
-            wait_time = 0.5  # Default wait time
-            
-            # If action seems complex, wait longer
-            action_complexity_indicators = ['multiple', 'sequence', 'complex', 'carefully']
-            if any(indicator in action_text.lower() for indicator in action_complexity_indicators):
-                wait_time = 1.0  # Longer wait for complex actions
+            # Get the control directive directly from the planner
+            if isinstance(action, ActionStep):
+                # Get the control directive from the most recent history entry
+                entry = planner.action_history[-1] if planner.action_history else None
+                control = entry.get("control", {}) if entry else {}
+                reasoning = entry.get("reasoning", "") if entry else ""
                 
+                action_text = action.action_description
+                self.logger.info(f"New action: {action.step_id} - {action_text}")
+                self.logger.info(f"Control: {control}, Reasoning: {reasoning}")
+                
+                # Store this action ID to track if we're getting the same action repeatedly
+                self.last_action_id = action.step_id
+                
+                # Store this control to track changes
+                self.last_control = control
+            else:
+                # Fallback for backward compatibility
+                control = {}
+                action_text = action
+                self.logger.info(f"Direct text action: {action_text}")
+                
+            # Execute the control directive directly without parsing
+            self.logger.info(f"Executing control directive: {control}")
+            result = self.sima_agent.execute_control(control, action_text)
+            
+            # Minimal wait time - just enough to register the action
+            wait_time = 0.025  # Even shorter wait time for maximum responsiveness
             time.sleep(wait_time)
             
-            # Update video observation to capture the result - more efficient approach
-            max_frames = 3
-            frames_captured = 0
-            last_change_detected = False
+            # Just capture a single frame for immediate feedback
+            self.video_observer.update()
             
-            # Capture frames until we either see a change or hit our limit
-            while frames_captured < max_frames:
-                self.video_observer.update()
-                frames_captured += 1
-                
-                # Only wait between frames if we haven't captured enough yet
-                if frames_captured < max_frames:
-                    time.sleep(0.05)  # Shorter wait between frame captures
+            # Skip any further waiting - we'll maintain the control until next action
             
             # Get updated observation using traditional method
             current_observation = self._get_current_observation()
@@ -1149,7 +1480,7 @@ class GameTestingPipeline:
                 action_description = action.action_description
             else:
                 # Fallback if action is a string (backward compatibility)
-                step_id = f"{'EXPLORE' if step_count <= 5 else 'TEST'}-{step_count:03d}"
+                step_id = f"ACTION-{step_count:03d}"
                 action_description = action
                 
             execution_result = ExecutionResult(
@@ -1166,6 +1497,10 @@ class GameTestingPipeline:
             # Update planner with the result
             planner.update_action_result(execution_result.step_id, execution_result.to_dict())
             
+        # Force release touch at the end of testing to ensure clean shutdown
+        self.logger.info("Testing complete - releasing touch control")
+        self.sima_agent._stop_current_action(force_release=True)
+        
         # Analyze the results with video context
         self.logger.info("Analyzing execution results with video context")
         
@@ -1262,16 +1597,16 @@ class GameTestingPipeline:
                     self.logger.info("Using cached observation for similar frame")
                     return self._frame_description_cache[image_hash]
                 
-                # Construct a prompt appropriate for general 3D games
+                # Construct a prompt appropriate for Push'em All mobile game - prioritizing key gameplay elements
                 prompt = """
-                Describe this 3D game state in detail. Focus on:
-                1. The player character position and state
-                2. The environment and visible objects
-                3. Any NPCs, enemies, or interactive elements
-                4. The apparent objective or current mission
-                5. Any physics interactions or dynamic elements
-                6. Any unusual visual artifacts or glitches
-                7. Spatial relationships and navigation possibilities
+                Describe ONLY the most important elements in this Push'em All game screen:
+                1. Player position: where is the player on the platform? (left, right, center)
+                2. Platform edges: where are the nearest platform edges relative to the player?
+                3. Enemies: where are enemies positioned relative to player? (left, right, ahead)
+                4. Pushing opportunities: which direction should player swipe to push enemies off?
+                5. Hazards: any immediate dangers to avoid?
+                
+                BE EXTREMELY BRIEF - just 2-3 sentences focusing on actionable information.
                 """
             else:
                 # Fall back to traditional screenshot method
@@ -1282,24 +1617,25 @@ class GameTestingPipeline:
                 if screenshot is None:
                     return "The game state could not be observed. No screenshot available."
                 
-                # Construct a prompt appropriate for jelly block game
+                # Construct a focused prompt for Push'em All using the same approach
                 prompt = """
-                Describe this jelly block puzzle game state in detail. Focus on:
-                1. The arrangement of blocks on the grid
-                2. The colors, sizes, and numbers on blocks
-                3. Any special blocks or power-ups
-                4. The overall objective based on what you see
-                5. The current progress toward that objective
-                6. Any blocks that appear to be isolated or unable to merge
+                Describe ONLY the most important elements in this Push'em All game screen:
+                1. Player position: where is the player on the platform? (left, right, center)
+                2. Platform edges: where are the nearest platform edges relative to the player?
+                3. Enemies: where are enemies positioned relative to player? (left, right, ahead)
+                4. Pushing opportunities: which direction should player swipe to push enemies off?
+                5. Hazards: any immediate dangers to avoid?
+                
+                BE EXTREMELY BRIEF - just 2-3 sentences focusing on actionable information.
                 """
             
-            # Use OpenAI's vision model to describe the game state
+            # Use OpenAI's vision model to describe the game state - with minimal prompt for speed
             response = self.llm_client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a specialized vision analyst for video games. You provide detailed observations about the current game state to assist with testing and bug detection."
+                        "content": "You are a vision analyst for Push'em All mobile game. Provide brief, direct observations about the current game state."
                     },
                     {
                         "role": "user", 
@@ -1315,7 +1651,7 @@ class GameTestingPipeline:
                         ]
                     }
                 ],
-                max_tokens=500
+                max_tokens=200  # Reduced token count for faster response
             )
             description = response.choices[0].message.content
             
@@ -1336,47 +1672,55 @@ class GameTestingPipeline:
             return "Failed to get observation due to an error."
 
 def test_current_level():
-    """Test the currently visible level using video processing and adaptive planning"""
-    print("\n===== Testing Current Level With Video Processing =====\n")
+    """Test the currently visible level of Push'em All using video processing and adaptive planning"""
+    print("\n===== Testing Push'em All Level With Video Processing =====\n")
     
-    # Game and feature descriptions for a 3D game
-    game_description = """3D Adventure Game is an open-world exploration game where players navigate through various environments,
-    solve puzzles, and interact with objects and characters.
+    # Game description for Push'em All
+    game_description = """Push'em All is a hyper-casual 3D arcade game where players control a character equipped with a retractable pushing rod.
+    The primary objective is to push enemies off elevated platforms while navigating toward the finish line without falling off yourself.
     
     The game features:
-    - A 3D environment with physics simulation
-    - Player character with movement abilities (walk, run, jump, interact)
-    - Various interactive objects that can be manipulated
-    - Environmental puzzles that require spatial reasoning
-    - Character progression and inventory system
+    - Character that automatically moves forward along defined paths on elevated platforms
+    - Physics-based pushing mechanics using an extendable rod controlled by swipe gestures
+    - Various enemy types with different movement patterns and behaviors
+    - Elevated platforms with open edges where both player and enemies can fall off
+    - Power-ups that may enhance pushing abilities or provide special advantages
+    - Increasing difficulty levels with more complex platform layouts and enemy behaviors
     """
     
-    feature_description = """The physics interaction system allows players to manipulate objects in the game world
-    with realistic physical properties. Objects should respond to gravity, collisions, and player interactions
-    in a consistent and predictable manner.
+    feature_description = """The pushing mechanics system is the core feature that allows players to push enemies off platforms using touch and swipe controls.
+    The physics-based system should create realistic pushing interactions between the player's rod and enemies.
     
     The feature implementation ensures that:
-    1. Objects have appropriate mass, friction, and collision properties
-    2. Objects can be pushed, pulled, picked up, and thrown based on their size and weight
-    3. Physics interactions do not cause objects to clip through walls or other solid objects
-    4. Objects at rest remain stable and do not jitter or move unexpectedly
-    5. Collisions between objects produce appropriate responses and sound effects
+    1. The pushing rod extends in the direction you swipe with appropriate length and force
+    2. Enemies react realistically when pushed, with momentum and physics determining their movement
+    3. Multiple enemies can be pushed simultaneously for combo effects
+    4. The angle and force of the push affects how enemies move and whether they fall off edges
+    5. Enemies should not clip through platforms or exhibit unrealistic physics behavior
+    6. The player should be able to retract the rod by releasing the touch
+    7. Platform edges properly detect when enemies or the player falls off
     """
     
-    # Create a test task for a 3D game
+    # Create a test task specific to Push'em All
     test_task = TestTask(
-        task_id="physics_interaction_test",
-        description="Test if physics interactions in the 3D environment work correctly and consistently",
-        initial_state="Player is in a 3D environment with various interactive objects visible",
-        expected_outcome="Objects should respond realistically to player interactions, respect collision boundaries, and not exhibit glitches or unexpected behavior"
+        task_id="push_enemies_test",
+        description="Test if the pushing mechanics and physics interactions work correctly and consistently",
+        initial_state="Player is on an elevated platform with multiple enemies visible",
+        expected_outcome="Enemies should respond realistically to pushing actions, move according to physics rules, and fall off when pushed beyond platform edges"
     )
     
     # Create pipeline instance with configuration for video processing
     config = {
-        "video_buffer_size": 8,  # Store 8 frames for analysis
-        "capture_fps": 15,      # Capture at 15 frames per second
-        "resize_shape": (800, 600),  # Resolution for captures
-        "change_threshold": 0.1  # Sensitivity for detecting changes
+        # Video processing settings
+        "video_buffer_size": 4,        # Reduced buffer size for faster processing
+        "capture_fps": 15,            # Capture at 15 frames per second
+        "resize_shape": (800, 600),   # Resolution for captures
+        "change_threshold": 0.1,      # Sensitivity for detecting changes
+        
+        # Gameplay settings
+        "continuous_mode": True,       # Maintain controls until new ones are issued
+        "use_exploration_phase": False, # Skip exploration and directly play the game
+        "exploration_budget": 3        # Only used if exploration is enabled
     }
     
     pipeline = GameTestingPipeline(config)
